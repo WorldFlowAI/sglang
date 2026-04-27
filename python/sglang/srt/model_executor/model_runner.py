@@ -2909,7 +2909,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 layer_recompute_mask=seg_layer_mask,
             )
 
-            forward_batch.req_to_token_pool.req_to_token[req_idx, target_positions] = new_locs
+            # req_to_token is int32 in SGLang; allocator returns int64. Cast
+            # to match destination dtype to avoid:
+            # "Index put requires the source and destination dtypes match"
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
+            req_to_token[req_idx, target_positions] = new_locs.to(req_to_token.dtype)
             total_realized += seg_len
 
         if forward_batch.reqs and len(forward_batch.reqs) > 0:
