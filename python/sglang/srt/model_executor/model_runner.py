@@ -2758,17 +2758,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         copy V directly and K with RoPE correction (reverse old + apply new),
         then update req_to_token_pool to point to the new slots.
 
-        This avoids mutating the original pool locations (which belong to the
-        radix tree of another request) and eliminates the need for save/restore.
+        Two paths:
+
+        * Legacy (TokenBlockMatch): a single contiguous span of
+          ``fuzzy_matched_len`` tokens at offset ``fuzzy_cached_start_pos``
+          on the donor side, mapping to the LAST ``fuzzy_matched_len``
+          positions of the current prefix on the target side.
+
+        * Segment-aware (SemanticEmbedding): when
+          ``forward_batch.fuzzy_segments`` is populated the donor positions
+          and target positions are non-contiguous (REORDER, multi-donor).
+          We iterate per-segment, applying the same allocate-then-correct
+          dance scoped to each segment's ``donor_positions ->
+          target_positions`` deltas.
+
+        Layer recompute mask: when ``forward_batch.fuzzy_layer_recompute_mask``
+        is True for layer ``i``, we skip the K/V copy on that layer so the
+        attention forward sees zeros and the model produces fresh K/V via
+        the prefill compute path.
         """
         num_fuzzy = forward_batch.fuzzy_matched_len
-        cached_start_pos = forward_batch.fuzzy_cached_start_pos
-        if num_fuzzy <= 0:
+        if num_fuzzy <= 0 and not forward_batch.fuzzy_segments:
             return
 
         pool = forward_batch.token_to_kv_pool
         if not hasattr(pool, 'k_buffer'):
             return
+
+        rotary_emb = self._get_rotary_emb()
+        if rotary_emb is None:
+            logger.warning("[FUZZY] Cannot find rotary_emb on model, skipping RoPE correction")
+            return
+
+        if forward_batch.fuzzy_segments:
+            self._correct_fuzzy_kv_rope_segments(forward_batch, pool, rotary_emb)
+        else:
+            self._correct_fuzzy_kv_rope_contiguous(forward_batch, pool, rotary_emb)
+
+    def _correct_fuzzy_kv_rope_contiguous(
+        self,
+        forward_batch: ForwardBatch,
+        pool,
+        rotary_emb,
+    ):
+        """Original single-contiguous-span path (TokenBlockMatchProvider)."""
+        num_fuzzy = forward_batch.fuzzy_matched_len
+        cached_start_pos = forward_batch.fuzzy_cached_start_pos
 
         # Get the pool locations for fuzzy-matched tokens.
         # prefix_len = exact_matched_len + fuzzy_matched_len
@@ -2801,47 +2836,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=device, dtype=torch.long,
         )
 
-        # Get the rotary embedding's cos_sin_cache from the model.
-        rotary_emb = None
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            layer0 = self.model.model.layers[0]
-            if hasattr(layer0, 'self_attn') and hasattr(layer0.self_attn, 'rotary_emb'):
-                rotary_emb = layer0.self_attn.rotary_emb
-        if rotary_emb is None:
-            logger.warning("[FUZZY] Cannot find rotary_emb on model, skipping RoPE correction")
-            self.token_to_kv_pool_allocator.free(new_fuzzy_locs)
-            return
-
-        cos_sin_cache = rotary_emb.cos_sin_cache
-        is_neox_style = rotary_emb.is_neox_style
-        rotary_dim = rotary_emb.rotary_dim
-
-        # Get cos/sin for old and new positions
-        old_cos_sin = cos_sin_cache.index_select(0, old_positions)
-        new_cos_sin = cos_sin_cache.index_select(0, new_positions)
-        old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
-        new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
-
-        from sglang.srt.layers.rotary_embedding.utils import (
-            apply_rotary_emb,
-            reverse_rotary_emb,
+        self._copy_kv_with_rope_correction(
+            pool=pool,
+            rotary_emb=rotary_emb,
+            old_locs=old_fuzzy_locs,
+            new_locs=new_fuzzy_locs,
+            old_positions=old_positions,
+            new_positions=new_positions,
+            layer_recompute_mask=forward_batch.fuzzy_layer_recompute_mask,
         )
-
-        for layer_id in range(pool.layer_num):
-            # Copy V directly to new slots
-            pool.v_buffer[layer_id][new_fuzzy_locs] = pool.v_buffer[layer_id][old_fuzzy_locs]
-
-            # Copy K with RoPE correction to new slots
-            k = pool.k_buffer[layer_id][old_fuzzy_locs]  # [num_fuzzy, head_num, head_dim]
-            k_rot = k[..., :rotary_dim]
-            k_pass = k[..., rotary_dim:]
-
-            k_raw = reverse_rotary_emb(k_rot, old_cos, old_sin, is_neox_style)
-            k_new = apply_rotary_emb(k_raw, new_cos, new_sin, is_neox_style)
-
-            pool.k_buffer[layer_id][new_fuzzy_locs] = torch.cat(
-                (k_new, k_pass), dim=-1
-            )
 
         # Update req_to_token_pool to point to new slots
         forward_batch.req_to_token_pool.req_to_token[
@@ -2857,6 +2860,98 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"corrected RoPE from positions [{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
             f"to [{exact_matched_len}..{prefix_len - 1}]"
         )
+
+    def _correct_fuzzy_kv_rope_segments(
+        self,
+        forward_batch: ForwardBatch,
+        pool,
+        rotary_emb,
+    ):
+        """Segment-aware path (SemanticEmbeddingProvider, multi-donor / N:M).
+
+        Each segment carries its own ``donor_positions``, ``target_positions``,
+        and ``donor_kv_indices``. We iterate independently, re-using the
+        allocator + copy_kv_with_rope_correction helper.
+        """
+        device = pool.k_buffer[0].device
+        req_idx = forward_batch.req_pool_indices[0].item()
+        layer_recompute_mask_global = forward_batch.fuzzy_layer_recompute_mask
+        total_realized = 0
+
+        for seg in forward_batch.fuzzy_segments:
+            donor_positions = _as_long_tensor(seg.donor_positions, device)
+            target_positions = _as_long_tensor(seg.target_positions, device)
+            donor_locs = _as_long_tensor(seg.donor_kv_indices, device)
+            if donor_positions.numel() == 0:
+                continue
+            if donor_positions.shape != target_positions.shape:
+                logger.warning(
+                    "[FUZZY] segment donor/target position shape mismatch: %s vs %s",
+                    donor_positions.shape,
+                    target_positions.shape,
+                )
+                continue
+            seg_len = donor_positions.numel()
+            new_locs = self.token_to_kv_pool_allocator.alloc(seg_len)
+            if new_locs is None:
+                logger.warning("[FUZZY] segment alloc failed (n=%d), skipping", seg_len)
+                continue
+
+            seg_layer_mask = seg.layer_recompute_mask or layer_recompute_mask_global
+
+            self._copy_kv_with_rope_correction(
+                pool=pool,
+                rotary_emb=rotary_emb,
+                old_locs=donor_locs,
+                new_locs=new_locs,
+                old_positions=donor_positions,
+                new_positions=target_positions,
+                layer_recompute_mask=seg_layer_mask,
+            )
+
+            forward_batch.req_to_token_pool.req_to_token[req_idx, target_positions] = new_locs
+            total_realized += seg_len
+
+        if forward_batch.reqs and len(forward_batch.reqs) > 0:
+            forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+
+        logger.info(
+            "[FUZZY] Realized %d fuzzy tokens across %d segment(s)",
+            total_realized,
+            len(forward_batch.fuzzy_segments),
+        )
+
+    def _copy_kv_with_rope_correction(
+        self,
+        pool,
+        rotary_emb,
+        old_locs,
+        new_locs,
+        old_positions,
+        new_positions,
+        layer_recompute_mask=None,
+    ):
+        """Per-layer K/V copy with RoPE delta correction (delegates to helper)."""
+        from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
+            copy_kv_with_rope_correction,
+        )
+
+        copy_kv_with_rope_correction(
+            pool=pool,
+            rotary_emb=rotary_emb,
+            old_locs=old_locs,
+            new_locs=new_locs,
+            old_positions=old_positions,
+            new_positions=new_positions,
+            layer_recompute_mask=layer_recompute_mask,
+        )
+
+    def _get_rotary_emb(self):
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layer0 = self.model.model.layers[0]
+            if hasattr(layer0, 'self_attn') and hasattr(layer0.self_attn, 'rotary_emb'):
+                return layer0.self_attn.rotary_emb
+        return None
 
     def forward_extend(
         self,
@@ -3256,6 +3351,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype=torch.uint8,
                     device=self.device,
                 )
+
+
+def _as_long_tensor(obj, device) -> torch.Tensor:
+    """Thin proxy to the standalone helper (kept for module-local readability)."""
+    from sglang.srt.mem_cache.fuzzy_match.rope_correction import as_long_tensor
+
+    return as_long_tensor(obj, device)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

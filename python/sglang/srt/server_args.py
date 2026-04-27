@@ -375,6 +375,17 @@ class ServerArgs:
     fuzzy_non_prefix_max_entries: int = 10000
     fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
+
+    # SemanticEmbedding-specific (ignored when fuzzy_match_provider != "SemanticEmbedding")
+    embedding_backend: str = "local"
+    gateway_url: Optional[str] = None
+    gateway_timeout_ms: int = 3
+    embedding_use_gpu: bool = True
+    fuzzy_model_arch: Optional[str] = None
+    enable_bathtub: bool = True
+    fuzzy_top_k: int = 5
+    fuzzy_min_reuse_ratio: float = 0.50
+    quality_gate_ppl_threshold: float = 1.065
     
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -4418,6 +4429,63 @@ class ServerArgs:
             type=str,
             default=ServerArgs.embedding_model_name,
             help="Embedding model name for SemanticEmbeddingProvider.",
+        )
+        parser.add_argument(
+            "--embedding-backend",
+            type=str,
+            choices=["local", "gateway"],
+            default=ServerArgs.embedding_backend,
+            help="SemanticEmbeddingProvider backend: 'local' runs the embed/search "
+                 "pipeline in-process; 'gateway' delegates to a remote ANN service.",
+        )
+        parser.add_argument(
+            "--gateway-url",
+            type=str,
+            default=ServerArgs.gateway_url,
+            help="Gateway URL when --embedding-backend=gateway.",
+        )
+        parser.add_argument(
+            "--gateway-timeout-ms",
+            type=int,
+            default=ServerArgs.gateway_timeout_ms,
+            help="Gateway request timeout in milliseconds (falls back to local on timeout).",
+        )
+        parser.add_argument(
+            "--no-embedding-gpu",
+            dest="embedding_use_gpu",
+            action="store_false",
+            help="Force the SemanticEmbeddingProvider's MiniLM embedder onto CPU.",
+        )
+        parser.add_argument(
+            "--fuzzy-model-arch",
+            type=str,
+            default=ServerArgs.fuzzy_model_arch,
+            help="Model arch tag for SemanticEmbeddingProvider's bathtub-curve "
+                 "preset selector (e.g. 'llama', 'qwen2.5-7b').",
+        )
+        parser.add_argument(
+            "--no-bathtub",
+            dest="enable_bathtub",
+            action="store_false",
+            help="Disable per-layer bathtub recomputation in SemanticEmbeddingProvider.",
+        )
+        parser.add_argument(
+            "--fuzzy-top-k",
+            type=int,
+            default=ServerArgs.fuzzy_top_k,
+            help="Top-K candidates pulled from the donor store before alignment.",
+        )
+        parser.add_argument(
+            "--fuzzy-min-reuse-ratio",
+            type=float,
+            default=ServerArgs.fuzzy_min_reuse_ratio,
+            help="Minimum reuse ratio (matched / prompt tokens) for a semantic hit.",
+        )
+        parser.add_argument(
+            "--quality-gate-ppl-threshold",
+            type=float,
+            default=ServerArgs.quality_gate_ppl_threshold,
+            help="Informational PPL guardrail (telemetry only).",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

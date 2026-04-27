@@ -439,6 +439,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For fuzzy prefix matching
     fuzzy_matched_len: int = 0  # Number of tokens from fuzzy match
     fuzzy_cached_start_pos: int = 0  # Original position where fuzzy KV was computed
+    # Optional N:M segments — set by SemanticEmbedding-style providers; when
+    # populated, model_runner._correct_fuzzy_kv_rope iterates per-segment.
+    fuzzy_segments: Optional[list] = None
+    # Optional per-layer recomputation mask; element ``i`` True means layer
+    # ``i`` recomputes the matched tokens instead of reusing donor KV.
+    fuzzy_layer_recompute_mask: Optional[list] = None
     # Reference to req objects (for fuzzy realization flag propagation)
     reqs: Optional[list] = None
 
@@ -501,6 +507,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
             if fuzzy_match_result is not None:
                 ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
+                ret.fuzzy_segments = getattr(fuzzy_match_result, 'segments', None)
+                ret.fuzzy_layer_recompute_mask = getattr(
+                    fuzzy_match_result, 'layer_recompute_mask', None,
+                )
 
 
         if batch.extend_input_logprob_token_ids is not None:
