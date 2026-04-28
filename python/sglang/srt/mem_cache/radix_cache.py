@@ -992,6 +992,15 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
+        # Symmetrize the _node_registry lifecycle. Without this, every
+        # TreeNode created via _register_node accumulates in the registry
+        # forever, even after the radix tree has logically evicted it.
+        # Diagnosed during SemBlend SemanticEmbedding bench (run 4,
+        # 2026-04-27): pool memory leak detector tripped with
+        # evictable_size_ > total after sustained fuzzy hits — accounting
+        # drift caused by _node_registry holding evicted TreeNodes alive
+        # through their `.value` tensor refs to pool slots.
+        self._node_registry.pop(node.id, None)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):

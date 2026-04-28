@@ -79,6 +79,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "gateway_url": config.gateway_url,
                 "gateway_timeout_ms": config.gateway_timeout_ms,
                 "quality_gate_ppl_threshold": config.quality_gate_ppl_threshold,
+                "discovery_only": config.discovery_only,
             }
         )
         self._adapter = SemBlendProviderAdapter(config=adapter_config)

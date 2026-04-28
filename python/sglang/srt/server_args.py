@@ -386,6 +386,7 @@ class ServerArgs:
     fuzzy_top_k: int = 5
     fuzzy_min_reuse_ratio: float = 0.50
     quality_gate_ppl_threshold: float = 1.065
+    fuzzy_discovery_only: bool = False
     
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -4486,6 +4487,14 @@ class ServerArgs:
             type=float,
             default=ServerArgs.quality_gate_ppl_threshold,
             help="Informational PPL guardrail (telemetry only).",
+        )
+        parser.add_argument(
+            "--fuzzy-discovery-only",
+            action="store_true",
+            help="Run the SemanticEmbedding pipeline for telemetry only -- "
+                 "do NOT inject donor KV into match_prefix's device_indices. "
+                 "Workaround for the upstream RadixCache _node_registry leak "
+                 "until the fix in _delete_leaf lands.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

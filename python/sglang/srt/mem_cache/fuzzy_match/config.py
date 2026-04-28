@@ -102,6 +102,15 @@ class FuzzyMatchConfig:
     # Informational PPL guardrail (telemetry; not enforced in-flight).
     quality_gate_ppl_threshold: float = 1.065
 
+    # Discovery-only mode: SemBlend runs the full pipeline (embed +
+    # search + align + bathtub) and emits hit metrics, but does NOT
+    # inject donor KV indices into match_prefix's device_indices. Use
+    # this to measure semantic-discovery effectiveness on top of an
+    # unpatched RadixCache that would otherwise leak under sustained
+    # fuzzy hits (see fix in radix_cache._delete_leaf for the underlying
+    # _node_registry issue).
+    discovery_only: bool = False
+
     def __post_init__(self):
         """Validate configuration values."""
         if self.fuzzy_min_match_length < 1:
@@ -180,4 +189,5 @@ class FuzzyMatchConfig:
             quality_gate_ppl_threshold=getattr(
                 server_args, 'quality_gate_ppl_threshold', 1.065,
             ),
+            discovery_only=getattr(server_args, 'fuzzy_discovery_only', False),
         )
