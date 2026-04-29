@@ -119,6 +119,14 @@ class FuzzyMatchResult:
     segments: Optional[List[FuzzyMatchSegment]] = None
     layer_recompute_mask: Optional[List[bool]] = None
     quality_signals: Optional[QualitySignals] = None
+    # ID of the donor's TreeNode in radix_tree._node_registry. When set, the
+    # caller (RadixCache.match_prefix) is responsible for inc_lock_ref'ing the
+    # donor node so its KV-cache slots can't be LRU-evicted while the new
+    # request is consuming them, and dec_lock_ref'ing on request finish.
+    # Without this, sustained fuzzy traffic causes the SGLang runtime checker's
+    # "pool memory leak detected!" assertion to fire (~19k slots leaked per
+    # ~50-75 fuzzy-mode requests on Qwen-1.5B / A10G).
+    donor_last_node_id: Optional[int] = None
     # Free-form provider-private payload (avoid name collisions with future fields).
     _match_entry: Any = None
 
@@ -185,6 +193,21 @@ class FuzzyMatchProvider(ABC):
         """
         pass
     
+    def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
+        """Optional hook: called by RadixCache.cache_finished_req AFTER the
+        donor's KV has been inserted into the radix tree, with the resulting
+        TreeNode id from ``radix_tree._node_registry``.
+
+        Providers that need to inc_lock_ref the donor TreeNode at match time
+        (i.e. all providers that surface real KV reuse via cached_token_count > 0)
+        should record this id keyed on the request and surface it as
+        ``FuzzyMatchResult.donor_last_node_id`` from ``match_on_prefix_miss``.
+
+        Default is a no-op for backward compatibility. Override in providers
+        that need donor-node locking.
+        """
+        return None
+
     @abstractmethod
     def match_on_prefix_miss(
         self,

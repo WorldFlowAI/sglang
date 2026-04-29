@@ -136,6 +136,22 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
             return None
         return _adapter_to_sglang_result(adapter_result)
 
+    def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
+        """Forward the donor's TreeNode id from RadixCache to the adapter.
+
+        Called by RadixCache.cache_finished_req after the donor's KV has been
+        inserted. Without this, the donor's slots aren't lock_ref'd at match
+        time and LRU eviction frees them while a recipient request is
+        consuming them, tripping the SGLang pool-leak detector.
+        """
+        request_id = getattr(request, "rid", None) or getattr(request, "request_id", None)
+        if request_id is None:
+            return
+        self._adapter.on_donor_inserted(
+            request_id=str(request_id),
+            donor_last_node_id=donor_last_node_id,
+        )
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -200,6 +216,7 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
         segments=segments,
         layer_recompute_mask=adapter_result.layer_recompute_mask,
         quality_signals=quality,
+        donor_last_node_id=getattr(adapter_result, "donor_last_node_id", None),
         _match_entry=adapter_result._match_entry,
     )
 

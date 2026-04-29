@@ -510,11 +510,35 @@ class RadixCache(BasePrefixCache):
                     device=value.device,
                     dtype=value.dtype,
                 )
-                
+
                 # Mark request as fuzzy-matched
                 if params.req is not None:
                     params.req.fuzzy_match_result = fuzzy_result
-                
+
+                # Lock-ref the donor TreeNode so its KV slots stay protected
+                # while this request is consuming them. Without this, LRU
+                # eviction of the donor would free the slots referenced in
+                # fuzzy_kv_indices, causing the runtime pool-leak detector
+                # to fire. The dec_lock_ref pair runs in cache_finished_req.
+                # See FuzzyMatchResult.donor_last_node_id.
+                if (
+                    params.req is not None
+                    and fuzzy_result.donor_last_node_id is not None
+                ):
+                    donor_node = self._node_registry.get(
+                        fuzzy_result.donor_last_node_id
+                    )
+                    if donor_node is not None:
+                        self.inc_lock_ref(donor_node)
+                        params.req.fuzzy_donor_node = donor_node
+                    else:
+                        logger.warning(
+                            f"[FUZZY RADIX] donor_last_node_id="
+                            f"{fuzzy_result.donor_last_node_id} not in "
+                            f"_node_registry; donor KV may be evicted "
+                            f"mid-request"
+                        )
+
                 merged_value = torch.cat([value, fuzzy_kv_indices])
                 return MatchResult(
                     device_indices=merged_value,
@@ -604,12 +628,15 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
-        
+        prefix_len, last_node = self._insert_helper(self.root_node, key, value, priority, chunked)
+
         # Register the root node (always registered)
         self._register_node(self.root_node)
-        
-        return InsertResult(prefix_len=prefix_len)
+
+        return InsertResult(
+            prefix_len=prefix_len,
+            last_node_id=last_node.id if last_node is not None else None,
+        )
     
     def _register_node(self, node: TreeNode):
         """Register a TreeNode in the node registry for reference resolution by non_prefix_store."""
@@ -676,6 +703,27 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+
+            # Notify the fuzzy provider of the donor's last_node so it can
+            # surface donor_last_node_id at match time. Without this, donor
+            # KV slots aren't lock_ref'd and LRU eviction frees them while
+            # a future fuzzy-matched request is consuming them, causing the
+            # SGLang runtime checker's "pool memory leak detected!" assertion.
+            if (
+                self._fuzzy_cache_enabled
+                and result.last_node_id is not None
+            ):
+                try:
+                    self.fuzzy_match_provider.on_donor_inserted(
+                        request=req,
+                        donor_last_node_id=result.last_node_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[FUZZY RADIX] on_donor_inserted failed: {e}"
+                    )
+                    import traceback
+                    logger.debug(traceback.format_exc())
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
@@ -686,6 +734,14 @@ class RadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
+
+        # Symmetrize lock_ref on the donor TreeNode (paired with inc_lock_ref
+        # in match_prefix's fuzzy success branch). Done last so the dec runs
+        # in lock-step with the request-level dec_lock_ref above.
+        donor_node = getattr(req, "fuzzy_donor_node", None)
+        if donor_node is not None:
+            self.dec_lock_ref(donor_node)
+            req.fuzzy_donor_node = None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
@@ -739,6 +795,12 @@ class RadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
+
+        # Symmetrize fuzzy donor lock_ref. The donor was inc_lock_ref'd in
+        # match_prefix's fuzzy success branch. cache_unfinished_req fires for
+        # chunked prefill stages; the donor must remain protected until
+        # cache_finished_req. So we don't dec here -- only at request finish.
+        # No-op intentionally; comment kept for clarity.
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
@@ -927,7 +989,7 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = self.get_child_key_fn(key)
 
@@ -964,7 +1026,8 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""

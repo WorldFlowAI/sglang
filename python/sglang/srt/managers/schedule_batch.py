@@ -736,6 +736,12 @@ class Req(ReqDllmMixin):
         # request's tree nodes via non_prefix_store and should NOT be freed
         # in cache_finished_req since they're not this request's own allocation.
         self.cache_fuzzy_matched_len: int = 0
+        # Donor TreeNode (in radix tree) lock_ref'd at fuzzy match time.
+        # Set by RadixCache.match_prefix on a successful fuzzy match; released
+        # by RadixCache.cache_finished_req. Without this, the donor's KV
+        # slots can be LRU-evicted while this request is still consuming
+        # them, causing the SGLang runtime pool-leak detector to fire.
+        self.fuzzy_donor_node: Any = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1221,6 +1227,11 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
+        # Note: fuzzy_donor_node is intentionally not reset on retraction —
+        # it's released by cache_finished_req when the request actually
+        # finishes. Retraction doesn't run cache_finished_req, so the
+        # donor remains lock_ref'd until the retracted request is finalized
+        # later (which still goes through cache_finished_req).
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
