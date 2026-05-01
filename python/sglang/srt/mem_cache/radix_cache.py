@@ -495,16 +495,80 @@ class RadixCache(BasePrefixCache):
             
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
+
+                # Pre-allocate the realization slots in the pool BEFORE we
+                # commit any fuzzy state (lock_refs, fuzzy_match_result on
+                # req, merged device_indices). Rationale: the previous
+                # design allocated inside model_runner._correct_fuzzy_kv_rope.
+                # When that alloc failed under memory pressure the
+                # function returned without rolling back the donor
+                # inc_lock_ref or the recipient's req_to_token_pool entries
+                # — leaving the recipient's pool slice pointing at the
+                # donor's slots, which were then double-freed at
+                # cache_finished_req. That manifested as evictable_size_ >
+                # total at the next is_fully_idle window (Bug #3 in the
+                # 2026-04-29 scbench crash).
+                #
+                # By pre-allocating here, capacity is checked at match
+                # time. On failure we fall back cleanly to exact-only
+                # match — no partial fuzzy commit, no inconsistent state.
+                # When cached_start_pos == exact_matched_len AND the result
+                # is a single contiguous span (segments is None), the
+                # donor's slots are already at the position the recipient
+                # needs. _correct_fuzzy_kv_rope's contiguous path skips
+                # allocation in that branch; we mirror that here so we
+                # don't reserve pool slots that won't be used.
+                # Multi-segment N:M results always need fresh slots
+                # because target_positions are scattered.
+                needs_realization = fuzzy_matched_len > 0 and (
+                    fuzzy_result.segments is not None
+                    or fuzzy_result.cached_start_pos != exact_matched_len
+                )
+                if params.req is not None and needs_realization:
+                    realized_locs = self.token_to_kv_pool_allocator.alloc(
+                        fuzzy_matched_len
+                    )
+                    if realized_locs is None:
+                        logger.info(
+                            f"[FUZZY RADIX] no pool capacity for "
+                            f"{fuzzy_matched_len} fuzzy tokens; "
+                            f"falling back to exact-only match"
+                        )
+                        # No state has been mutated yet — keep any prior
+                        # fuzzy realization on the req intact and just
+                        # return exact match for this call.
+                        return MatchResult(
+                            device_indices=value,
+                            last_device_node=last_node,
+                            last_host_node=last_node,
+                        )
+
+                    # New alloc succeeded. If a previous fuzzy realization
+                    # on this req never consumed its pre-allocated slots
+                    # (chunked-prefill re-entry, or aborted forward), free
+                    # the old slots before overwriting.
+                    prev_locs = getattr(params.req, "fuzzy_realized_locs", None)
+                    if prev_locs is not None:
+                        try:
+                            self.token_to_kv_pool_allocator.free(prev_locs)
+                        except Exception:  # pragma: no cover — defensive
+                            pass
+                    params.req.fuzzy_realized_locs = realized_locs
+                else:
+                    realized_locs = None
+
                 miss_len = total_len - exact_matched_len - fuzzy_matched_len
                 logger.info(
                     f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, "
                     f"fuzzy={fuzzy_matched_len}, miss={miss_len}, total={total_len}, "
-                    f"cached_start_pos={fuzzy_result.cached_start_pos}"
+                    f"cached_start_pos={fuzzy_result.cached_start_pos}, "
+                    f"realized_locs={'pre-allocated' if realized_locs is not None else 'none'}"
                 )
 
-                # Merge exact and fuzzy KV indices
-                # No repositioning here - RoPE correction is handled in
-                # model_runner._correct_fuzzy_kv_rope by allocating new pool slots.
+                # Merge exact and fuzzy KV indices. The fuzzy_kv_indices
+                # tensor still references the donor's slots; the actual
+                # KV copy + RoPE correction into realized_locs happens
+                # in model_runner._correct_fuzzy_kv_rope.
                 fuzzy_kv_indices = torch.tensor(
                     fuzzy_result.kv_cache_indices,
                     device=value.device,
@@ -516,10 +580,11 @@ class RadixCache(BasePrefixCache):
                     params.req.fuzzy_match_result = fuzzy_result
 
                 # Lock-ref the donor TreeNode so its KV slots stay protected
-                # while this request is consuming them. Without this, LRU
-                # eviction of the donor would free the slots referenced in
-                # fuzzy_kv_indices, causing the runtime pool-leak detector
-                # to fire. The dec_lock_ref pair runs in cache_finished_req.
+                # while this request is consuming them (until KV is copied
+                # into realized_locs in _correct_fuzzy_kv_rope, after which
+                # the recipient no longer needs the donor). Without this,
+                # LRU eviction of the donor would free the slots referenced
+                # in fuzzy_kv_indices, causing pool corruption.
                 # See FuzzyMatchResult.donor_last_node_id.
                 if (
                     params.req is not None
@@ -529,6 +594,15 @@ class RadixCache(BasePrefixCache):
                         fuzzy_result.donor_last_node_id
                     )
                     if donor_node is not None:
+                        # Defensive: if a previous fuzzy match on this req
+                        # left a different donor locked (chunked-prefill or
+                        # post-retraction re-entry), release it before
+                        # locking the new one. Without this, two donors
+                        # are locked but only one gets dec'd at finish,
+                        # leaking lock_ref.
+                        prev_donor = getattr(params.req, "fuzzy_donor_node", None)
+                        if prev_donor is not None and prev_donor is not donor_node:
+                            self.dec_lock_ref(prev_donor)
                         self.inc_lock_ref(donor_node)
                         params.req.fuzzy_donor_node = donor_node
                     else:
@@ -647,6 +721,22 @@ class RadixCache(BasePrefixCache):
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
+
+        # Defensive cleanup: if model_runner._correct_fuzzy_kv_rope never
+        # consumed the pre-allocated realization slots (e.g., request was
+        # aborted before forward, or fuzzy_segments path partially consumed
+        # them), free them back to the pool here so they don't leak.
+        # See RadixCache.match_prefix and Req.fuzzy_realized_locs.
+        realized_locs = getattr(req, "fuzzy_realized_locs", None)
+        if realized_locs is not None:
+            try:
+                self.token_to_kv_pool_allocator.free(realized_locs)
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning(
+                    f"[FUZZY RADIX] failed to free unconsumed "
+                    f"fuzzy_realized_locs (n={len(realized_locs)}): {e}"
+                )
+            req.fuzzy_realized_locs = None
 
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:

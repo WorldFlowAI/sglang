@@ -2819,11 +2819,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_idx, exact_matched_len:prefix_len
         ]
 
-        # Allocate new pool slots for the fuzzy tokens
-        new_fuzzy_locs = self.token_to_kv_pool_allocator.alloc(num_fuzzy)
+        # Consume slots that were pre-allocated by RadixCache.match_prefix.
+        # Pre-allocation moved to match_prefix time so we cannot fail here
+        # mid-request and leave the recipient's req_to_token_pool pointing
+        # at the donor's slots (Bug #3, 2026-04-29 scbench crash).
+        req = (
+            forward_batch.reqs[0]
+            if forward_batch.reqs and len(forward_batch.reqs) > 0
+            else None
+        )
+        new_fuzzy_locs = getattr(req, "fuzzy_realized_locs", None) if req is not None else None
         if new_fuzzy_locs is None:
-            logger.warning("[FUZZY] Failed to allocate new pool slots for fuzzy tokens, skipping RoPE correction")
-            return
+            # Legacy/test fallback path. If we ever get here with a real
+            # bench, match_prefix didn't pre-allocate — that's a bug.
+            new_fuzzy_locs = self.token_to_kv_pool_allocator.alloc(num_fuzzy)
+            if new_fuzzy_locs is None:
+                logger.error(
+                    "[FUZZY] alloc failed without pre-allocation; "
+                    "skipping RoPE correction (this should not happen "
+                    "after match_prefix pre-alloc — investigate)"
+                )
+                return
 
         # Compute old and new positions
         device = pool.k_buffer[0].device
@@ -2849,15 +2865,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Update req_to_token_pool to point to new slots
         forward_batch.req_to_token_pool.req_to_token[
             req_idx, exact_matched_len:prefix_len
-        ] = new_fuzzy_locs
+        ] = new_fuzzy_locs.to(forward_batch.req_to_token_pool.req_to_token.dtype)
 
         # Mark fuzzy tokens as realized so cache_finished_req skips the realize step
         if forward_batch.reqs and len(forward_batch.reqs) > 0:
             forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+            # Realized_locs has now been written into req_to_token_pool;
+            # the slots will be freed via the standard cache_finished_req
+            # free path. Clear the field so cache_finished_req's defensive
+            # cleanup doesn't double-free.
+            forward_batch.reqs[0].fuzzy_realized_locs = None
 
         logger.info(
-            f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: allocated new pool slots, "
-            f"corrected RoPE from positions [{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
+            f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: copied donor KV with RoPE "
+            f"correction from positions [{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
             f"to [{exact_matched_len}..{prefix_len - 1}]"
         )
 
@@ -2870,13 +2891,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Segment-aware path (SemanticEmbeddingProvider, multi-donor / N:M).
 
         Each segment carries its own ``donor_positions``, ``target_positions``,
-        and ``donor_kv_indices``. We iterate independently, re-using the
-        allocator + copy_kv_with_rope_correction helper.
+        and ``donor_kv_indices``. The total realization slots are
+        pre-allocated as a single block in ``RadixCache.match_prefix`` and
+        stashed on ``req.fuzzy_realized_locs``; we slice that block per
+        segment as we iterate. Pre-allocation prevents the alloc-failure-
+        no-rollback path that produced Bug #3 (2026-04-29 scbench crash).
         """
         device = pool.k_buffer[0].device
         req_idx = forward_batch.req_pool_indices[0].item()
         layer_recompute_mask_global = forward_batch.fuzzy_layer_recompute_mask
         total_realized = 0
+
+        req = (
+            forward_batch.reqs[0]
+            if forward_batch.reqs and len(forward_batch.reqs) > 0
+            else None
+        )
+        realized_locs = (
+            getattr(req, "fuzzy_realized_locs", None) if req is not None else None
+        )
+        locs_offset = 0
 
         for seg in forward_batch.fuzzy_segments:
             donor_positions = _as_long_tensor(seg.donor_positions, device)
@@ -2892,10 +2926,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 continue
             seg_len = donor_positions.numel()
-            new_locs = self.token_to_kv_pool_allocator.alloc(seg_len)
-            if new_locs is None:
-                logger.warning("[FUZZY] segment alloc failed (n=%d), skipping", seg_len)
-                continue
+
+            # Slice the next seg_len slots out of the pre-allocated block.
+            # If pre-alloc is missing (legacy / test path), fall back to
+            # alloc-on-demand and warn — under the new design this should
+            # not happen because match_prefix pre-allocates total length.
+            if realized_locs is not None and locs_offset + seg_len <= len(realized_locs):
+                new_locs = realized_locs[locs_offset : locs_offset + seg_len]
+                locs_offset += seg_len
+            else:
+                new_locs = self.token_to_kv_pool_allocator.alloc(seg_len)
+                if new_locs is None:
+                    logger.error(
+                        "[FUZZY] segment alloc failed (n=%d) without pre-alloc; "
+                        "skipping segment (this should not happen after "
+                        "match_prefix pre-alloc)", seg_len,
+                    )
+                    continue
 
             seg_layer_mask = seg.layer_recompute_mask or layer_recompute_mask_global
 
@@ -2916,8 +2963,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_to_token[req_idx, target_positions] = new_locs.to(req_to_token.dtype)
             total_realized += seg_len
 
-        if forward_batch.reqs and len(forward_batch.reqs) > 0:
-            forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+        if req is not None:
+            req.cache_fuzzy_matched_len = 0
+            # Free any pre-allocated slots that weren't consumed (e.g.
+            # segments with shape mismatches were skipped). The consumed
+            # slots are now in req_to_token_pool and will be freed via
+            # the standard cache_finished_req path; only the unconsumed
+            # tail needs explicit free.
+            if (
+                realized_locs is not None
+                and locs_offset < len(realized_locs)
+            ):
+                unused = realized_locs[locs_offset:]
+                try:
+                    self.token_to_kv_pool_allocator.free(unused)
+                except Exception:  # pragma: no cover — defensive
+                    pass
+            req.fuzzy_realized_locs = None
 
         logger.info(
             "[FUZZY] Realized %d fuzzy tokens across %d segment(s)",
