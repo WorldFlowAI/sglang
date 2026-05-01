@@ -39,19 +39,50 @@ class FuzzyMatchSegment:
     Providers that produce a single contiguous span (``TokenBlockMatchProvider``)
     set ``segments = None`` and the legacy contiguous path runs unchanged.
 
+    Two addressing modes:
+
+    * **NodeRef** (preferred for new providers, e.g. SemBlend): the segment
+      points at a TreeNode in the radix tree's ``_node_registry`` via
+      ``donor_node_id`` + ``donor_offset`` + ``length``. ``model_runner``
+      resolves to pool indices at consume time:
+
+          node = radix_tree._node_registry[donor_node_id]
+          donor_kv_slots = node.value[donor_offset : donor_offset + length]
+
+      This preserves the "no double-counting" principle (the radix tree is
+      the single owner of pool indices) and ties slot lifetime to the donor
+      TreeNode's lifetime — paired with ``FuzzyMatchResult.donor_last_node_id``
+      ``inc_lock_ref`` protection.
+
+    * **Legacy pool-indices** (``donor_kv_indices``): a raw tensor of pool
+      indices. Used by ``TokenBlockMatchProvider``'s contiguous-span path.
+
     Attributes:
-        donor_kv_indices: Pool indices on the donor side for this segment.
         target_positions: Absolute token positions in the new prompt.
         donor_positions: Source positions in the donor (used to compute the
             RoPE delta per token).
+        donor_node_id: Optional ID of the donor TreeNode in the radix tree's
+            ``_node_registry``. NodeRef-based addressing.
+        donor_offset: Optional offset into the donor TreeNode's ``value``
+            tensor where this segment's slots begin.
+        length: Optional number of slots this segment covers in the donor.
+        donor_kv_indices: Optional raw pool-indices tensor (legacy).
         donor_req_id: Optional identifier of the source donor (multi-donor).
         layer_recompute_mask: Optional per-segment override of the global
             ``FuzzyMatchResult.layer_recompute_mask``.
     """
 
-    donor_kv_indices: torch.Tensor
     target_positions: torch.Tensor
     donor_positions: torch.Tensor
+
+    # NodeRef-based addressing (preferred for new providers).
+    donor_node_id: Optional[int] = None
+    donor_offset: Optional[int] = None
+    length: Optional[int] = None
+
+    # Legacy pool-indices tensor.
+    donor_kv_indices: Optional[torch.Tensor] = None
+
     donor_req_id: Optional[str] = None
     layer_recompute_mask: Optional[List[bool]] = None
 

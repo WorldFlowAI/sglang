@@ -71,16 +71,9 @@ class FuzzyMatchConfig:
     # ----------------------------------------------------------------
     # SemanticEmbeddingProvider-specific fields (ignored by other providers)
     # ----------------------------------------------------------------
-
-    # Embedding backend: "local" runs the embed/search pipeline in-process,
-    # "gateway" delegates to a remote ANN service (e.g. Synapse Gateway).
-    embedding_backend: str = "local"
-
-    # Gateway URL when embedding_backend == "gateway".
-    gateway_url: Optional[str] = None
-
-    # Async gateway timeout (ms). Falls back to local on timeout.
-    gateway_timeout_ms: int = 3
+    #
+    # SemanticEmbedding is process-local: in-process MiniLM embedding and
+    # numpy donor store. There is no remote backend / service mode.
 
     # Whether the in-process embedder may use GPU (auto-detected).
     embedding_use_gpu: bool = True
@@ -141,17 +134,6 @@ class FuzzyMatchConfig:
                 f"got {self.fuzzy_non_prefix_max_entries}"
             )
 
-        if self.embedding_backend not in ("local", "gateway"):
-            raise ValueError(
-                f"embedding_backend must be 'local' or 'gateway', "
-                f"got {self.embedding_backend}"
-            )
-
-        if self.embedding_backend == "gateway" and not self.gateway_url:
-            raise ValueError(
-                "gateway_url is required when embedding_backend == 'gateway'"
-            )
-
         if not (0.0 < self.fuzzy_min_reuse_ratio <= 1.0):
             raise ValueError(
                 f"fuzzy_min_reuse_ratio must be in (0.0, 1.0], "
@@ -178,9 +160,6 @@ class FuzzyMatchConfig:
             fuzzy_non_prefix_max_entries=getattr(server_args, 'fuzzy_non_prefix_max_entries', 10000),
             fuzzy_block_size=getattr(server_args, 'fuzzy_block_size', 16),
             embedding_model_name=getattr(server_args, 'embedding_model_name', 'all-MiniLM-L6-v2'),
-            embedding_backend=getattr(server_args, 'embedding_backend', 'local'),
-            gateway_url=getattr(server_args, 'gateway_url', None),
-            gateway_timeout_ms=getattr(server_args, 'gateway_timeout_ms', 3),
             embedding_use_gpu=getattr(server_args, 'embedding_use_gpu', True),
             model_arch=getattr(server_args, 'fuzzy_model_arch', None),
             enable_bathtub=getattr(server_args, 'enable_bathtub', True),

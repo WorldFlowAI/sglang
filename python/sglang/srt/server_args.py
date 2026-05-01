@@ -376,10 +376,9 @@ class ServerArgs:
     fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
 
-    # SemanticEmbedding-specific (ignored when fuzzy_match_provider != "SemanticEmbedding")
-    embedding_backend: str = "local"
-    gateway_url: Optional[str] = None
-    gateway_timeout_ms: int = 3
+    # SemanticEmbedding-specific (ignored when fuzzy_match_provider != "SemanticEmbedding").
+    # SemanticEmbedding is process-local: in-process MiniLM embedding, numpy
+    # donor store. No remote backend.
     embedding_use_gpu: bool = True
     fuzzy_model_arch: Optional[str] = None
     enable_bathtub: bool = True
@@ -4430,26 +4429,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.embedding_model_name,
             help="Embedding model name for SemanticEmbeddingProvider.",
-        )
-        parser.add_argument(
-            "--embedding-backend",
-            type=str,
-            choices=["local", "gateway"],
-            default=ServerArgs.embedding_backend,
-            help="SemanticEmbeddingProvider backend: 'local' runs the embed/search "
-                 "pipeline in-process; 'gateway' delegates to a remote ANN service.",
-        )
-        parser.add_argument(
-            "--gateway-url",
-            type=str,
-            default=ServerArgs.gateway_url,
-            help="Gateway URL when --embedding-backend=gateway.",
-        )
-        parser.add_argument(
-            "--gateway-timeout-ms",
-            type=int,
-            default=ServerArgs.gateway_timeout_ms,
-            help="Gateway request timeout in milliseconds (falls back to local on timeout).",
         )
         parser.add_argument(
             "--no-embedding-gpu",

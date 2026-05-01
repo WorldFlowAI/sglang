@@ -17,8 +17,10 @@ Thin SGLang-side wrapper around the ``semblend`` pip package's adapter.
 Heavy lifting (MiniLM embedding, donor store, alignment, bathtub curve,
 partial-attention planning) lives in ``semblend_core`` and is reused unchanged.
 
-The ``semblend`` dependency is imported lazily so installs that don't
-configure ``fuzzy_match_provider="SemanticEmbedding"`` never load it.
+SemBlend is process-local: in-process MiniLM embedding and a numpy donor
+store. There is no service dependency or network hop. The ``semblend``
+dependency is imported lazily so installs that don't configure
+``fuzzy_match_provider="SemanticEmbedding"`` never load it.
 """
 
 from __future__ import annotations
@@ -44,12 +46,9 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
 
     Construction lazily imports ``semblend.integration.sglang.provider`` so
     SGLang installs without ``semblend`` work fine until the operator opts
-    in via ``fuzzy_match_provider="SemanticEmbedding"``.
-
-    Two backends, selected by ``FuzzyMatchConfig.embedding_backend``:
-      - ``"local"`` (default): in-process MiniLM embedding + numpy ANN.
-      - ``"gateway"``: delegates to a remote Synapse Gateway (cuVS CAGRA),
-        with fallback to local on timeout.
+    in via ``fuzzy_match_provider="SemanticEmbedding"``. SemBlend is
+    process-local: in-process MiniLM embedding + numpy ANN. No service
+    dependency.
     """
 
     def __init__(self, config: FuzzyMatchConfig):
@@ -75,18 +74,14 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "model_arch": config.model_arch,
                 "enable_bathtub": config.enable_bathtub,
                 "top_k": config.fuzzy_top_k,
-                "embedding_backend": config.embedding_backend,
-                "gateway_url": config.gateway_url,
-                "gateway_timeout_ms": config.gateway_timeout_ms,
                 "quality_gate_ppl_threshold": config.quality_gate_ppl_threshold,
                 "discovery_only": config.discovery_only,
             }
         )
         self._adapter = SemBlendProviderAdapter(config=adapter_config)
         logger.info(
-            "SemanticEmbeddingProvider initialized: backend=%s, threshold=%.2f, "
+            "SemanticEmbeddingProvider initialized: threshold=%.2f, "
             "min_reuse=%.2f, model_arch=%s, enable_bathtub=%s",
-            config.embedding_backend,
             config.fuzzy_semantic_threshold,
             config.fuzzy_min_reuse_ratio,
             config.model_arch,
@@ -186,9 +181,16 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
     if adapter_result.segments is not None:
         segments = [
             FuzzyMatchSegment(
-                donor_kv_indices=_as_tensor(s.donor_kv_indices),
                 target_positions=_as_tensor(s.target_positions),
                 donor_positions=_as_tensor(s.donor_positions),
+                donor_node_id=s.donor_node_id,
+                donor_offset=s.donor_offset,
+                length=s.length,
+                donor_kv_indices=(
+                    _as_tensor(s.donor_kv_indices)
+                    if s.donor_kv_indices is not None
+                    else None
+                ),
                 donor_req_id=s.donor_req_id,
                 layer_recompute_mask=s.layer_recompute_mask,
             )
