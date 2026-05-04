@@ -2778,7 +2778,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         the prefill compute path.
         """
         num_fuzzy = forward_batch.fuzzy_matched_len
-        if num_fuzzy <= 0 and not forward_batch.fuzzy_segments:
+        # Single-source-of-truth gate. Segments are valid only when there's
+        # something to realize; once ``cache_fuzzy_matched_len`` has been
+        # zeroed by the first-chunk realization, every subsequent chunk
+        # must short-circuit. Without this, the segments path would
+        # re-alloc fresh slots and orphan the first-chunk slots
+        # (9102-slot leak under SemanticEmbedding + chunked prefill,
+        # observed 2026-05-04). The init_new guard in forward_batch_info
+        # is the primary fix; this is defense-in-depth.
+        if num_fuzzy <= 0:
             return
 
         pool = forward_batch.token_to_kv_pool

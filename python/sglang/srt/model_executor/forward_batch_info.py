@@ -499,18 +499,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
-        # Populate fuzzy match info from the first request (single-request batch assumption)
+        # Populate fuzzy match info from the first request (single-request batch assumption).
+        #
+        # Guard the populate behind ``cache_fuzzy_matched_len > 0``. The
+        # sentinel is set to 0 by ``_correct_fuzzy_kv_rope_{contiguous,
+        # segments}`` after the first chunk realizes the donor KV. For
+        # subsequent chunks of the same request (chunked prefill), we must
+        # not re-enter the fuzzy correction path: ``req.fuzzy_realized_locs``
+        # is already cleared, so the segments path would alloc fresh slots
+        # and overwrite ``req_to_token_pool``, orphaning the first-chunk
+        # slots. That's the 9102-slot leak observed during longeval-16384 +
+        # SemanticEmbedding (2026-05-04 a10g bench).
         if batch.reqs and len(batch.reqs) > 0:
             ret.reqs = batch.reqs
             first_req = batch.reqs[0]
             ret.fuzzy_matched_len = getattr(first_req, 'cache_fuzzy_matched_len', 0)
-            fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
-            if fuzzy_match_result is not None:
-                ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
-                ret.fuzzy_segments = getattr(fuzzy_match_result, 'segments', None)
-                ret.fuzzy_layer_recompute_mask = getattr(
-                    fuzzy_match_result, 'layer_recompute_mask', None,
-                )
+            if ret.fuzzy_matched_len > 0:
+                fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
+                if fuzzy_match_result is not None:
+                    ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
+                    ret.fuzzy_segments = getattr(fuzzy_match_result, 'segments', None)
+                    ret.fuzzy_layer_recompute_mask = getattr(
+                        fuzzy_match_result, 'layer_recompute_mask', None,
+                    )
 
 
         if batch.extend_input_logprob_token_ids is not None:
