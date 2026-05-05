@@ -2886,16 +2886,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # cache_finished_req path. Clearing avoids a double-free in
             # cache_finished_req's defensive cleanup.
             req.fuzzy_realized_locs = None
-            # cache_protected_len was set at match_prefix time to cover
-            # exact + fuzzy because the fuzzy region then referenced the
-            # donor's tree-owned slots. After realization those positions
-            # reference slots we own, so the protection can collapse back
-            # to just the exact-match prefix. Leaving it inflated would
-            # silently leak any realized slots that a later insert walk
-            # finds duplicated in the radix tree.
-            req.cache_protected_len = max(
-                req.cache_protected_len - num_fuzzy, 0
-            )
 
         logger.info(
             f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: copied donor KV with RoPE "
@@ -2984,16 +2974,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # to match destination dtype to avoid:
             # "Index put requires the source and destination dtypes match"
             req_to_token = forward_batch.req_to_token_pool.req_to_token
+
+            # The slots currently at ``target_positions`` were placed by
+            # ``alloc_for_extend`` because the multi-segment path returns
+            # ``prefix_indices`` covering only the exact-match prefix; the
+            # extend region therefore spans the entire fuzzy region too,
+            # and its allocator slots got written into
+            # ``req_to_token_pool[exact:total]``. Overwriting those entries
+            # with ``new_locs`` here makes the displaced extend slots
+            # unreferenced by any request or tree node — they remain
+            # decremented from the allocator's available counter without
+            # showing up in evictable, producing a per-request pool-slot
+            # leak equal to ``len(target_positions)``. Free them back to
+            # the allocator so the invariant
+            # ``total = available + evictable + protected + ...`` holds.
+            displaced_locs = req_to_token[req_idx, target_positions].to(
+                torch.int64
+            )
+            self.token_to_kv_pool_allocator.free(displaced_locs)
+
             req_to_token[req_idx, target_positions] = new_locs.to(req_to_token.dtype)
             total_realized += seg_len
 
         if req is not None:
             req.cache_fuzzy_matched_len = 0
-            # Consumed slots are tracked through ``req_to_token_pool`` and
-            # will be reclaimed by ``cache_finished_req``. The pre-alloc
-            # block may be longer than what we actually consumed (e.g.
-            # segments skipped on shape mismatch); free the unconsumed
-            # tail so it does not leak.
+            # The pre-alloc block may be longer than what we consumed
+            # (e.g. segments skipped on shape mismatch); free the
+            # unconsumed tail so it does not leak.
             if (
                 realized_locs is not None
                 and locs_offset < len(realized_locs)
@@ -3004,37 +3011,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except Exception:  # pragma: no cover — defensive
                     pass
             req.fuzzy_realized_locs = None
-            # Collapse cache_protected_len back to the exact-match prefix
-            # so cache_finished_req's free-duplicates step can reclaim any
-            # realized slots that the radix insert walk later finds
-            # duplicated in the tree.
-            #
-            # Guarded on full realization. If some segments were skipped,
-            # the corresponding positions in req_to_token_pool still
-            # reference donor-owned slots; cache_protected_len is a
-            # single integer and cannot selectively cover only those
-            # positions, so we stay conservative rather than risk
-            # freeing donor-owned slots.
-            _before = req.cache_protected_len
-            _fb_fml = forward_batch.fuzzy_matched_len
-            _seg_count = len(forward_batch.fuzzy_segments) if forward_batch.fuzzy_segments else 0
-            _full_match = (total_realized == _fb_fml)
-            if _full_match:
-                req.cache_protected_len = max(
-                    req.cache_protected_len - total_realized, 0
-                )
-            logger.info(
-                "[FUZZY DBG] segments rid=%s entry_cpl=%d "
-                "total_realized=%d fb.fuzzy_matched_len=%d segments=%d "
-                "full_match=%s exit_cpl=%d",
-                getattr(req, 'rid', '?'),
-                _before,
-                total_realized,
-                _fb_fml,
-                _seg_count,
-                _full_match,
-                req.cache_protected_len,
-            )
 
         logger.info(
             "[FUZZY] Realized %d fuzzy tokens across %d segment(s)",

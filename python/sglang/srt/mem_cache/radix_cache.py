@@ -776,37 +776,14 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
-            # Diagnostic snapshot for tracking the fuzzy-realization
-            # accounting path. Tag-grep [FUZZY DBG] cache_finished_req.
-            _was_fuzzy = getattr(req, "fuzzy_match_result", None) is not None
-            _evict_before = self.evictable_size_
-            _avail_before = self.token_to_kv_pool_allocator.available_size()
-            _kv_indices_len = len(kv_indices)
-            _cpl = req.cache_protected_len
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
-            _free_count = max(new_prefix_len - _cpl, 0)
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
-            if _was_fuzzy:
-                _evict_after = self.evictable_size_
-                _avail_after = self.token_to_kv_pool_allocator.available_size()
-                logger.info(
-                    "[FUZZY DBG] cache_finished_req rid=%s "
-                    "cpl=%d new_prefix_len=%d kv_indices_len=%d "
-                    "free_count=%d evict_delta=%d avail_delta=%d",
-                    getattr(req, "rid", "?"),
-                    _cpl,
-                    new_prefix_len,
-                    _kv_indices_len,
-                    _free_count,
-                    _evict_after - _evict_before,
-                    _avail_after - _avail_before,
-                )
 
             # Notify the fuzzy provider of the donor's last_node so it can
             # surface donor_last_node_id at match time. Without this, donor
