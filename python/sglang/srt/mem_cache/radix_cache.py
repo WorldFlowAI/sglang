@@ -496,30 +496,23 @@ class RadixCache(BasePrefixCache):
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
 
-                # Pre-allocate the realization slots in the pool BEFORE we
-                # commit any fuzzy state (lock_refs, fuzzy_match_result on
-                # req, merged device_indices). Rationale: the previous
-                # design allocated inside model_runner._correct_fuzzy_kv_rope.
-                # When that alloc failed under memory pressure the
-                # function returned without rolling back the donor
-                # inc_lock_ref or the recipient's req_to_token_pool entries
-                # — leaving the recipient's pool slice pointing at the
-                # donor's slots, which were then double-freed at
-                # cache_finished_req. That manifested as evictable_size_ >
-                # total at the next is_fully_idle window (Bug #3 in the
-                # 2026-04-29 scbench crash).
+                # Pre-allocate realization slots before committing any
+                # fuzzy state (donor lock_ref, fuzzy_match_result, merged
+                # device_indices). If we deferred allocation to
+                # ``_correct_fuzzy_kv_rope`` and it failed under memory
+                # pressure, we could not cleanly roll back state already
+                # committed here, leaving the recipient's
+                # ``req_to_token_pool`` slice pointing at donor-owned
+                # slots. Pre-allocation makes the capacity check the
+                # first state-changing step: on failure we fall back to
+                # an exact-only match with no other side effects.
                 #
-                # By pre-allocating here, capacity is checked at match
-                # time. On failure we fall back cleanly to exact-only
-                # match — no partial fuzzy commit, no inconsistent state.
-                # When cached_start_pos == exact_matched_len AND the result
-                # is a single contiguous span (segments is None), the
-                # donor's slots are already at the position the recipient
-                # needs. _correct_fuzzy_kv_rope's contiguous path skips
-                # allocation in that branch; we mirror that here so we
-                # don't reserve pool slots that won't be used.
-                # Multi-segment N:M results always need fresh slots
-                # because target_positions are scattered.
+                # Skip the alloc when the donor's slots already sit at
+                # the recipient's target position (single contiguous
+                # span with ``cached_start_pos == exact_matched_len``);
+                # the contiguous correction path is a no-op in that
+                # case. Multi-segment N:M results always need fresh
+                # slots because target positions are scattered.
                 needs_realization = fuzzy_matched_len > 0 and (
                     fuzzy_result.segments is not None
                     or fuzzy_result.cached_start_pos != exact_matched_len
@@ -543,10 +536,10 @@ class RadixCache(BasePrefixCache):
                             last_host_node=last_node,
                         )
 
-                    # New alloc succeeded. If a previous fuzzy realization
-                    # on this req never consumed its pre-allocated slots
-                    # (chunked-prefill re-entry, or aborted forward), free
-                    # the old slots before overwriting.
+                    # If a prior match on this req left a pre-allocated
+                    # block that ``_correct_fuzzy_kv_rope`` never consumed
+                    # (e.g. chunked-prefill re-entry or an aborted
+                    # forward), free it before stashing the new block.
                     prev_locs = getattr(params.req, "fuzzy_realized_locs", None)
                     if prev_locs is not None:
                         try:
@@ -594,12 +587,11 @@ class RadixCache(BasePrefixCache):
                         fuzzy_result.donor_last_node_id
                     )
                     if donor_node is not None:
-                        # Defensive: if a previous fuzzy match on this req
-                        # left a different donor locked (chunked-prefill or
-                        # post-retraction re-entry), release it before
-                        # locking the new one. Without this, two donors
-                        # are locked but only one gets dec'd at finish,
-                        # leaking lock_ref.
+                        # Release the prior donor's lock_ref before
+                        # acquiring the new one. Without this, a chunked
+                        # or retracted-and-resumed request can end up
+                        # holding two locks but only releasing one at
+                        # finish, leaking lock_ref.
                         prev_donor = getattr(params.req, "fuzzy_donor_node", None)
                         if prev_donor is not None and prev_donor is not donor_node:
                             self.dec_lock_ref(prev_donor)
@@ -722,11 +714,10 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        # Defensive cleanup: if model_runner._correct_fuzzy_kv_rope never
-        # consumed the pre-allocated realization slots (e.g., request was
-        # aborted before forward, or fuzzy_segments path partially consumed
-        # them), free them back to the pool here so they don't leak.
-        # See RadixCache.match_prefix and Req.fuzzy_realized_locs.
+        # Reclaim any pre-allocated realization slots that
+        # ``_correct_fuzzy_kv_rope`` did not consume — e.g. a request
+        # aborted before forward, or partial consumption from the
+        # segments path. ``RadixCache.match_prefix`` is the producer.
         realized_locs = getattr(req, "fuzzy_realized_locs", None)
         if realized_locs is not None:
             try:
@@ -1145,14 +1136,9 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
-        # Symmetrize the _node_registry lifecycle. Without this, every
-        # TreeNode created via _register_node accumulates in the registry
-        # forever, even after the radix tree has logically evicted it.
-        # Diagnosed during SemBlend SemanticEmbedding bench (run 4,
-        # 2026-04-27): pool memory leak detector tripped with
-        # evictable_size_ > total after sustained fuzzy hits — accounting
-        # drift caused by _node_registry holding evicted TreeNodes alive
-        # through their `.value` tensor refs to pool slots.
+        # Mirror ``_register_node``: drop the entry when the tree
+        # evicts the leaf, so the registry does not retain references
+        # to evicted nodes (and, transitively, their ``.value`` tensors).
         self._node_registry.pop(node.id, None)
         self._update_leaf_status(node.parent)
 

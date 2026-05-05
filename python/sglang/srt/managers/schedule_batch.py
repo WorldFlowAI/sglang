@@ -743,14 +743,13 @@ class Req(ReqDllmMixin):
         # them, causing the SGLang runtime pool-leak detector to fire.
         self.fuzzy_donor_node: Any = None
 
-        # Pool slots pre-allocated by RadixCache.match_prefix for the fuzzy
-        # realization (KV copy with RoPE delta). Consumed by
-        # model_runner._correct_fuzzy_kv_rope, which writes them into
-        # req_to_token_pool and then clears this field. If the field is
-        # still set at cache_finished_req entry, the realization never
-        # ran (e.g., request aborted mid-prefill), and the slots are
-        # freed defensively. Pre-allocation prevents the alloc-failure-
-        # no-rollback path that produced Bug #3 (2026-04-29 scbench crash).
+        # Pool slots pre-allocated by ``RadixCache.match_prefix`` for the
+        # fuzzy realization (KV copy with RoPE delta). Consumed by
+        # ``model_runner._correct_fuzzy_kv_rope``, which writes them into
+        # ``req_to_token_pool`` and clears this field. If the field is
+        # still set when ``cache_finished_req`` runs, the realization
+        # never executed (e.g. the request was aborted before forward),
+        # and the slots are freed there as a defensive cleanup.
         self.fuzzy_realized_locs: Any = None
 
         # Whether or not if it is chunked. It increments whenever

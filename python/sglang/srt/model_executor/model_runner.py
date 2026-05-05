@@ -2778,11 +2778,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         the prefill compute path.
         """
         num_fuzzy = forward_batch.fuzzy_matched_len
-        # Single-source-of-truth gate. Segments are valid only when there's
-        # something to realize; once ``cache_fuzzy_matched_len`` has been
-        # zeroed by the first-chunk realization, every subsequent chunk
-        # must short-circuit. Without this, the segments path would
-        # re-alloc fresh slots and orphan the first-chunk slots.
+        # ``fuzzy_matched_len`` is the single source of truth for whether
+        # this batch needs correction. Segments are only meaningful when
+        # there is something to realize; once the first chunk has zeroed
+        # the sentinel, subsequent chunks must short-circuit so they do
+        # not re-allocate slots over already-realized positions.
         if num_fuzzy <= 0:
             return
 
@@ -2824,10 +2824,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_idx, exact_matched_len:prefix_len
         ]
 
-        # Consume slots that were pre-allocated by RadixCache.match_prefix.
-        # Pre-allocation moved to match_prefix time so we cannot fail here
-        # mid-request and leave the recipient's req_to_token_pool pointing
-        # at the donor's slots (Bug #3, 2026-04-29 scbench crash).
+        # Consume the realization slots pre-allocated by
+        # ``RadixCache.match_prefix``. Allocating here would risk failing
+        # mid-request after match_prefix has already merged donor KV
+        # indices into ``req_to_token_pool``; an alloc failure at that
+        # point cannot be cleanly rolled back and leaves the recipient
+        # pointing at the donor's slots.
         req = (
             forward_batch.reqs[0]
             if forward_batch.reqs and len(forward_batch.reqs) > 0
@@ -2835,14 +2837,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         new_fuzzy_locs = getattr(req, "fuzzy_realized_locs", None) if req is not None else None
         if new_fuzzy_locs is None:
-            # Legacy/test fallback path. If we ever get here with a real
-            # bench, match_prefix didn't pre-allocate — that's a bug.
+            # Fallback for test paths and any caller that did not go
+            # through match_prefix's pre-alloc. Reaching this branch from
+            # the scheduler indicates a contract violation.
             new_fuzzy_locs = self.token_to_kv_pool_allocator.alloc(num_fuzzy)
             if new_fuzzy_locs is None:
                 logger.error(
                     "[FUZZY] alloc failed without pre-allocation; "
-                    "skipping RoPE correction (this should not happen "
-                    "after match_prefix pre-alloc — investigate)"
+                    "skipping RoPE correction"
                 )
                 return
 
@@ -2872,28 +2874,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_idx, exact_matched_len:prefix_len
         ] = new_fuzzy_locs.to(forward_batch.req_to_token_pool.req_to_token.dtype)
 
-        # Mark fuzzy tokens as realized so cache_finished_req skips the realize step
+        # Reflect the realized state on the request so downstream consumers
+        # see consistent ownership of the fuzzy region.
         if forward_batch.reqs and len(forward_batch.reqs) > 0:
             req = forward_batch.reqs[0]
+            # Zeroing the sentinel prevents subsequent chunks of a chunked
+            # prefill from re-entering the correction path.
             req.cache_fuzzy_matched_len = 0
-            # Realized_locs has now been written into req_to_token_pool;
-            # the slots will be freed via the standard cache_finished_req
-            # free path. Clear the field so cache_finished_req's defensive
-            # cleanup doesn't double-free.
+            # The pre-allocated block is now written into req_to_token_pool;
+            # any further free responsibility flows through the standard
+            # cache_finished_req path. Clearing avoids a double-free in
+            # cache_finished_req's defensive cleanup.
             req.fuzzy_realized_locs = None
-            # cache_protected_len was set by match_prefix to
-            # exact_matched_len + fuzzy_matched_len because at that point
-            # the fuzzy region in req_to_token_pool referenced the donor's
-            # slots (tree-owned, must not be freed). After realization the
-            # fuzzy region points at our freshly-allocated realized_locs;
-            # those are ours, not the donor's. cache_finished_req's
-            # `free(kv_indices[cache_protected_len : new_prefix_len])`
-            # only frees beyond cache_protected_len, so leaving it inflated
-            # by num_fuzzy means duplicates inside the realized region
-            # (insert walk slices our value away when our request's tokens
-            # match an existing tree path) leak silently. Drop the
-            # protection back to exact_matched_len so insert-time duplicates
-            # in the realized region get properly reclaimed.
+            # cache_protected_len was set at match_prefix time to cover
+            # exact + fuzzy because the fuzzy region then referenced the
+            # donor's tree-owned slots. After realization those positions
+            # reference slots we own, so the protection can collapse back
+            # to just the exact-match prefix. Leaving it inflated would
+            # silently leak any realized slots that a later insert walk
+            # finds duplicated in the radix tree.
             req.cache_protected_len = max(
                 req.cache_protected_len - num_fuzzy, 0
             )
@@ -2910,14 +2909,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pool,
         rotary_emb,
     ):
-        """Segment-aware path (SemanticEmbeddingProvider, multi-donor / N:M).
+        """Segment-aware realization path (multi-donor / N:M).
 
         Each segment carries its own ``donor_positions``, ``target_positions``,
         and ``donor_kv_indices``. The total realization slots are
         pre-allocated as a single block in ``RadixCache.match_prefix`` and
         stashed on ``req.fuzzy_realized_locs``; we slice that block per
-        segment as we iterate. Pre-allocation prevents the alloc-failure-
-        no-rollback path that produced Bug #3 (2026-04-29 scbench crash).
+        segment as we iterate. Pre-allocation lets us fail the match
+        cleanly if pool capacity is unavailable, rather than committing
+        partial state in match_prefix and discovering the alloc failure
+        only after the donor's KV indices are already merged into
+        ``req_to_token_pool``.
         """
         device = pool.k_buffer[0].device
         req_idx = forward_batch.req_pool_indices[0].item()
@@ -2987,11 +2989,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if req is not None:
             req.cache_fuzzy_matched_len = 0
-            # Free any pre-allocated slots that weren't consumed (e.g.
-            # segments with shape mismatches were skipped). The consumed
-            # slots are now in req_to_token_pool and will be freed via
-            # the standard cache_finished_req path; only the unconsumed
-            # tail needs explicit free.
+            # Consumed slots are tracked through ``req_to_token_pool`` and
+            # will be reclaimed by ``cache_finished_req``. The pre-alloc
+            # block may be longer than what we actually consumed (e.g.
+            # segments skipped on shape mismatch); free the unconsumed
+            # tail so it does not leak.
             if (
                 realized_locs is not None
                 and locs_offset < len(realized_locs)
@@ -3002,21 +3004,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except Exception:  # pragma: no cover — defensive
                     pass
             req.fuzzy_realized_locs = None
-            # Drop cache_protected_len back by the number of realized
-            # positions so cache_finished_req can reclaim insert-time
-            # duplicates. The dominant pool-leak path observed in the v5
-            # a10g bench (4831 slots leaked == fuzzy_matched_len of the
-            # offending hit) was insert-walk slicing our realized values
-            # away when the request's tokens duplicated an existing tree
-            # path inside the protected fuzzy region.
+            # Collapse cache_protected_len back to the exact-match prefix
+            # so cache_finished_req's free-duplicates step can reclaim any
+            # realized slots that the radix insert walk later finds
+            # duplicated in the tree.
             #
-            # Only decrement when total_realized covers the full
-            # fuzzy_matched_len. Partial realization (segments skipped due
-            # to shape mismatch) leaves some positions still pointing at
-            # donor slots; cache_protected_len is a single integer, so we
-            # can't selectively protect only the donor positions. Stay
-            # conservative — accept a rare leak in the edge case rather
-            # than risk freeing donor-owned slots.
+            # Guarded on full realization. If some segments were skipped,
+            # the corresponding positions in req_to_token_pool still
+            # reference donor-owned slots; cache_protected_len is a
+            # single integer and cannot selectively cover only those
+            # positions, so we stay conservative rather than risk
+            # freeing donor-owned slots.
             if total_realized == forward_batch.fuzzy_matched_len:
                 req.cache_protected_len = max(
                     req.cache_protected_len - total_realized, 0
