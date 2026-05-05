@@ -2782,10 +2782,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # something to realize; once ``cache_fuzzy_matched_len`` has been
         # zeroed by the first-chunk realization, every subsequent chunk
         # must short-circuit. Without this, the segments path would
-        # re-alloc fresh slots and orphan the first-chunk slots
-        # (9102-slot leak under SemanticEmbedding + chunked prefill,
-        # observed 2026-05-04). The init_new guard in forward_batch_info
-        # is the primary fix; this is defense-in-depth.
+        # re-alloc fresh slots and orphan the first-chunk slots.
         if num_fuzzy <= 0:
             return
 
@@ -2877,12 +2874,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Mark fuzzy tokens as realized so cache_finished_req skips the realize step
         if forward_batch.reqs and len(forward_batch.reqs) > 0:
-            forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+            req = forward_batch.reqs[0]
+            req.cache_fuzzy_matched_len = 0
             # Realized_locs has now been written into req_to_token_pool;
             # the slots will be freed via the standard cache_finished_req
             # free path. Clear the field so cache_finished_req's defensive
             # cleanup doesn't double-free.
-            forward_batch.reqs[0].fuzzy_realized_locs = None
+            req.fuzzy_realized_locs = None
+            # cache_protected_len was set by match_prefix to
+            # exact_matched_len + fuzzy_matched_len because at that point
+            # the fuzzy region in req_to_token_pool referenced the donor's
+            # slots (tree-owned, must not be freed). After realization the
+            # fuzzy region points at our freshly-allocated realized_locs;
+            # those are ours, not the donor's. cache_finished_req's
+            # `free(kv_indices[cache_protected_len : new_prefix_len])`
+            # only frees beyond cache_protected_len, so leaving it inflated
+            # by num_fuzzy means duplicates inside the realized region
+            # (insert walk slices our value away when our request's tokens
+            # match an existing tree path) leak silently. Drop the
+            # protection back to exact_matched_len so insert-time duplicates
+            # in the realized region get properly reclaimed.
+            req.cache_protected_len = max(
+                req.cache_protected_len - num_fuzzy, 0
+            )
 
         logger.info(
             f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: copied donor KV with RoPE "
@@ -2988,6 +3002,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except Exception:  # pragma: no cover — defensive
                     pass
             req.fuzzy_realized_locs = None
+            # Drop cache_protected_len back by the number of realized
+            # positions so cache_finished_req can reclaim insert-time
+            # duplicates. The dominant pool-leak path observed in the v5
+            # a10g bench (4831 slots leaked == fuzzy_matched_len of the
+            # offending hit) was insert-walk slicing our realized values
+            # away when the request's tokens duplicated an existing tree
+            # path inside the protected fuzzy region.
+            #
+            # Only decrement when total_realized covers the full
+            # fuzzy_matched_len. Partial realization (segments skipped due
+            # to shape mismatch) leaves some positions still pointing at
+            # donor slots; cache_protected_len is a single integer, so we
+            # can't selectively protect only the donor positions. Stay
+            # conservative — accept a rare leak in the edge case rather
+            # than risk freeing donor-owned slots.
+            if total_realized == forward_batch.fuzzy_matched_len:
+                req.cache_protected_len = max(
+                    req.cache_protected_len - total_realized, 0
+                )
+            else:
+                logger.warning(
+                    "[FUZZY] partial realization (%d / %d): keeping "
+                    "cache_protected_len conservative; "
+                    "%d slots may leak",
+                    total_realized,
+                    forward_batch.fuzzy_matched_len,
+                    forward_batch.fuzzy_matched_len - total_realized,
+                )
 
         logger.info(
             "[FUZZY] Realized %d fuzzy tokens across %d segment(s)",
