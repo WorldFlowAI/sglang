@@ -3016,8 +3016,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # positions, so we stay conservative rather than risk
             # freeing donor-owned slots.
             if total_realized == forward_batch.fuzzy_matched_len:
+                _before = req.cache_protected_len
                 req.cache_protected_len = max(
                     req.cache_protected_len - total_realized, 0
+                )
+                logger.info(
+                    "[FUZZY DBG] segments rid=%s cache_protected_len: "
+                    "%d -> %d (decrement=%d, total_realized=%d)",
+                    getattr(req, 'rid', '?'),
+                    _before,
+                    req.cache_protected_len,
+                    total_realized,
+                    total_realized,
                 )
             else:
                 logger.warning(
