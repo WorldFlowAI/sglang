@@ -3015,29 +3015,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # single integer and cannot selectively cover only those
             # positions, so we stay conservative rather than risk
             # freeing donor-owned slots.
-            if total_realized == forward_batch.fuzzy_matched_len:
-                _before = req.cache_protected_len
+            _before = req.cache_protected_len
+            _fb_fml = forward_batch.fuzzy_matched_len
+            _seg_count = len(forward_batch.fuzzy_segments) if forward_batch.fuzzy_segments else 0
+            _full_match = (total_realized == _fb_fml)
+            if _full_match:
                 req.cache_protected_len = max(
                     req.cache_protected_len - total_realized, 0
                 )
-                logger.info(
-                    "[FUZZY DBG] segments rid=%s cache_protected_len: "
-                    "%d -> %d (decrement=%d, total_realized=%d)",
-                    getattr(req, 'rid', '?'),
-                    _before,
-                    req.cache_protected_len,
-                    total_realized,
-                    total_realized,
-                )
-            else:
-                logger.warning(
-                    "[FUZZY] partial realization (%d / %d): keeping "
-                    "cache_protected_len conservative; "
-                    "%d slots may leak",
-                    total_realized,
-                    forward_batch.fuzzy_matched_len,
-                    forward_batch.fuzzy_matched_len - total_realized,
-                )
+            logger.info(
+                "[FUZZY DBG] segments rid=%s entry_cpl=%d "
+                "total_realized=%d fb.fuzzy_matched_len=%d segments=%d "
+                "full_match=%s exit_cpl=%d",
+                getattr(req, 'rid', '?'),
+                _before,
+                total_realized,
+                _fb_fml,
+                _seg_count,
+                _full_match,
+                req.cache_protected_len,
+            )
 
         logger.info(
             "[FUZZY] Realized %d fuzzy tokens across %d segment(s)",
