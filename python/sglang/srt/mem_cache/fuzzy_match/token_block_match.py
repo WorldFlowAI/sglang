@@ -36,7 +36,6 @@ import torch
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.non_prefix_store import (
     NodeRef,
-    NonPrefixEntry,
     NonPrefixKVStore,
 )
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
@@ -178,8 +177,7 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
         node_refs = []
         
         # Traverse the tree to find nodes covering [cache_start_pos, cache_end_pos)
-        # We start from root and walk down, keeping track of the cumulative token count
-        current_pos = 0
+        # We start from root and walk down, keeping track of cumulative offsets.
         remaining = cache_end_pos - cache_start_pos
         
         # Walk the tree from root to find nodes in the target range
@@ -227,6 +225,8 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
         self,
         prompt_token_ids: List[int],
         already_matched_len: int,
+        request=None,
+        extra_key=None,
     ) -> Optional[FuzzyMatchResult]:
         """Find fuzzy match for the remaining prompt tokens.
         
@@ -265,7 +265,7 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
         candidates = self.non_prefix_store.find_by_block_hash(
             query_tokens=remaining,
             min_length=self.min_match_length,
-            extra_key=None,
+            extra_key=extra_key,
         )
         
         logger.info(
@@ -346,3 +346,7 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
             cached_start_pos=entry.start_pos + donor_start,
             donor_last_node_id=donor_last_node_id,
         )
+
+    def on_cache_reset(self) -> None:
+        """Drop side-store entries that reference reset radix nodes/KV slots."""
+        self.non_prefix_store.clear()

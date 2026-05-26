@@ -47,7 +47,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
-    _MIN_SEMBLEND_VERSION = "0.3.11"
+    _MIN_SEMBLEND_VERSION = "0.3.12"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
@@ -152,6 +152,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
             cache_start_pos=cache_start_pos,
             cache_end_pos=cache_end_pos,
             prompt_text=prompt_text,
+            extra_key=getattr(request, "extra_key", None),
             radix_tree=radix_tree,
         )
         t_submit_ms = (_time.monotonic() - t_submit_start) * 1000
@@ -170,12 +171,15 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         self,
         prompt_token_ids: List[int],
         already_matched_len: int,
+        request=None,
+        extra_key=None,
     ) -> Optional[FuzzyMatchResult]:
-        prompt_text = self._decode(None, prompt_token_ids[already_matched_len:])
+        prompt_text = self._decode(request, prompt_token_ids[already_matched_len:])
         adapter_result = self._adapter.match(
             prompt_token_ids=list(prompt_token_ids),
             already_matched_len=already_matched_len,
             prompt_text=prompt_text,
+            extra_key=extra_key,
         )
         if adapter_result is None:
             return None

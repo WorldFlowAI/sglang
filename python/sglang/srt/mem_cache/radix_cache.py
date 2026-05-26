@@ -712,6 +712,8 @@ class RadixCache(BasePrefixCache):
             result = self.fuzzy_match_provider.match_on_prefix_miss(
                 prompt_token_ids=params.key.token_ids,
                 already_matched_len=exact_matched_len,
+                request=params.req,
+                extra_key=params.key.extra_key,
             )
             
             # Note: non_prefix_store entries don't need additional locking here.
@@ -861,31 +863,6 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
-        # Cache to non_prefix_store BEFORE freeing indices, since non_prefix_store
-        # saves pool indices that must still be valid.
-        if self._fuzzy_cache_enabled:
-            try:
-                cache_start = getattr(req, 'cache_start_pos', None)
-                cache_end = getattr(req, 'cache_end_pos', None)
-
-                if cache_start is None:
-                    cache_start = 0
-                if cache_end is None or cache_end == -1:
-                    cache_end = len(token_ids)
-
-                self.fuzzy_match_provider.cache_on_request_finished(
-                    request=req,
-                    token_ids=token_ids,
-                    kv_cache=kv_indices,
-                    cache_start_pos=cache_start,
-                    cache_end_pos=cache_end,
-                    radix_tree=self,
-                )
-            except Exception as e:
-                logger.warning(f"[FUZZY RADIX] cache_on_request_finished failed: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
@@ -893,6 +870,35 @@ class RadixCache(BasePrefixCache):
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
             new_prefix_len = result.prefix_len
+
+            # Cache to fuzzy side stores after radix insert, but before freeing
+            # any duplicate or tail indices. TokenBlock needs the inserted
+            # TreeNode to create valid NodeRefs; SemanticEmbedding snapshots the
+            # KV index handle here so later request-pool mutations cannot corrupt
+            # donor handles.
+            if self._fuzzy_cache_enabled:
+                try:
+                    cache_start = getattr(req, "cache_start_pos", None)
+                    cache_end = getattr(req, "cache_end_pos", None)
+
+                    if cache_start is None:
+                        cache_start = 0
+                    if cache_end is None or cache_end == -1:
+                        cache_end = len(token_ids)
+
+                    self.fuzzy_match_provider.cache_on_request_finished(
+                        request=req,
+                        token_ids=token_ids,
+                        kv_cache=kv_indices,
+                        cache_start_pos=cache_start,
+                        cache_end_pos=cache_end,
+                        radix_tree=self,
+                    )
+                except Exception as e:
+                    logger.warning(f"[FUZZY RADIX] cache_on_request_finished failed: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+
             # Hand the inserted node id to the fuzzy provider so
             # subsequent donor lookups can resolve a stable NodeRef.
             if (

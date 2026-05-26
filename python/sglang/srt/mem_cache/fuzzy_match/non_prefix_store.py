@@ -144,6 +144,7 @@ class NonPrefixKVStore:
         self.max_entries = max_entries
         self.block_size = block_size
         self.entries: List[NonPrefixEntry] = []
+        self._entries_by_id: Dict[int, NonPrefixEntry] = {}
         self.block_index: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
         self._entry_id_counter = 0
         
@@ -154,6 +155,13 @@ class NonPrefixKVStore:
     def set_node_registry(self, registry: Dict[int, any]):
         """Set the node registry from RadixCache for resolving node references."""
         self._node_registry = registry
+
+    def clear(self) -> None:
+        """Clear all indexed entries after the owning radix/KV cache resets."""
+        self.entries.clear()
+        self._entries_by_id.clear()
+        self.block_index.clear()
+        self._entry_id_counter = 0
     
     def update_node_refs_on_split(self, old_node_id: int, new_node_id: int, split_len: int):
         """Update NodeRefs when a node is split.
@@ -260,6 +268,7 @@ class NonPrefixKVStore:
         )
         
         self.entries.append(entry)
+        self._entries_by_id[entry_id] = entry
         
         # Index by block hashes
         for i, block_hash in enumerate(block_hashes):
@@ -392,7 +401,9 @@ class NonPrefixKVStore:
                 continue
 
             for entry_id, cached_pos in self.block_index[block_hash]:
-                entry = self.entries[entry_id]
+                entry = self._entries_by_id.get(entry_id)
+                if entry is None:
+                    continue
 
                 # Filter by extra_key if specified
                 if extra_key is not None and entry.extra_key != extra_key:
@@ -537,6 +548,7 @@ class NonPrefixKVStore:
                 lru_idx = i
         
         evicted = self.entries.pop(lru_idx)
+        self._entries_by_id.pop(evicted.id, None)
         
         # Remove from block index
         for block_hash in (evicted.block_hashes or []):

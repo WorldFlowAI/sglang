@@ -2756,47 +2756,80 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Realization slots are pre-allocated by RadixCache.match_prefix
         and stashed on req.fuzzy_realized_locs. This function consumes
         that block; it never allocates. Contiguous matches go through
-        the single-segment path; scattered N:M matches use
-        forward_batch.fuzzy_segments.
+        the single-segment path; scattered N:M matches use the match
+        result stored on each request.
         """
-        num_fuzzy = forward_batch.fuzzy_matched_len
-        if num_fuzzy <= 0:
-            return
-
         pool = forward_batch.token_to_kv_pool
         if not hasattr(pool, "k_buffer"):
             return
 
         if not (forward_batch.reqs and len(forward_batch.reqs) > 0):
             return
-        req = forward_batch.reqs[0]
-        realized_locs = getattr(req, "fuzzy_realized_locs", None)
 
-        if forward_batch.fuzzy_segments:
-            self._correct_fuzzy_kv_rope_segments(
-                forward_batch, pool, req, realized_locs
-            )
-        else:
-            self._correct_fuzzy_kv_rope_contiguous(
-                forward_batch, pool, req, realized_locs
-            )
+        for batch_idx, req in enumerate(forward_batch.reqs):
+            num_fuzzy = getattr(req, "cache_fuzzy_matched_len", 0)
+            if num_fuzzy <= 0:
+                continue
 
-        # Clear per-request handles so chunked-prefill re-entry, decode
-        # batches, or retraction-and-resume don't re-trigger correction.
-        req.fuzzy_realized_locs = None
-        req.cache_fuzzy_matched_len = 0
+            fuzzy_match_result = getattr(req, "fuzzy_match_result", None)
+            if fuzzy_match_result is None:
+                req.cache_fuzzy_matched_len = 0
+                continue
+
+            realized_locs = getattr(req, "fuzzy_realized_locs", None)
+            cached_start_pos = getattr(fuzzy_match_result, "cached_start_pos", 0)
+            segments = getattr(fuzzy_match_result, "segments", None)
+            layer_recompute_mask = getattr(
+                fuzzy_match_result, "layer_recompute_mask", None
+            )
+            req_idx = forward_batch.req_pool_indices[batch_idx].item()
+            prefix_len = int(forward_batch.extend_prefix_lens_cpu[batch_idx])
+
+            if segments:
+                self._correct_fuzzy_kv_rope_segments(
+                    forward_batch,
+                    pool,
+                    req,
+                    realized_locs,
+                    req_idx,
+                    segments,
+                )
+            else:
+                self._correct_fuzzy_kv_rope_contiguous(
+                    forward_batch,
+                    pool,
+                    req,
+                    realized_locs,
+                    req_idx,
+                    prefix_len,
+                    num_fuzzy,
+                    cached_start_pos,
+                    layer_recompute_mask,
+                )
+
+            # Clear per-request handles so chunked-prefill re-entry, decode
+            # batches, or retraction-and-resume don't re-trigger correction.
+            req.fuzzy_realized_locs = None
+            req.cache_fuzzy_matched_len = 0
 
     def _correct_fuzzy_kv_rope_contiguous(
-        self, forward_batch: ForwardBatch, pool, req, realized_locs
+        self,
+        forward_batch: ForwardBatch,
+        pool,
+        req,
+        realized_locs,
+        req_idx: int,
+        prefix_len: int,
+        num_fuzzy: int,
+        cached_start_pos: int,
+        layer_recompute_mask,
     ):
-        num_fuzzy = forward_batch.fuzzy_matched_len
-        cached_start_pos = forward_batch.fuzzy_cached_start_pos
-        req_idx = forward_batch.req_pool_indices[0].item()
-        prefix_len = forward_batch.extend_prefix_lens_cpu[0]
         exact_matched_len = prefix_len - num_fuzzy
 
         # No copy needed when donor positions already align with target.
         if cached_start_pos == exact_matched_len:
+            if realized_locs is not None:
+                self.token_to_kv_pool_allocator.free(realized_locs)
             return
 
         if realized_locs is None:
@@ -2843,6 +2876,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             new_locs=new_fuzzy_locs,
             old_positions=old_positions,
             new_positions=new_positions,
+            layer_recompute_mask=layer_recompute_mask,
         )
 
         # Point req_to_token_pool at the new recipient-owned slots.
@@ -2859,7 +2893,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def _correct_fuzzy_kv_rope_segments(
-        self, forward_batch: ForwardBatch, pool, req, realized_locs
+        self,
+        forward_batch: ForwardBatch,
+        pool,
+        req,
+        realized_locs,
+        req_idx: int,
+        segments,
     ):
         """N:M alignment with scattered target positions.
 
@@ -2889,11 +2929,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             copy_kv_with_rope_correction,
         )
 
-        req_idx = forward_batch.req_pool_indices[0].item()
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         device = pool.k_buffer[0].device
 
-        segments = forward_batch.fuzzy_segments
         cursor = 0
         total_realized = 0
         for seg in segments:
@@ -2916,6 +2954,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 continue
             donor_locs = seg.donor_kv_indices.to(device).to(torch.long)
+
+            if cursor + seg_len > realized_locs.numel():
+                logger.warning(
+                    "[FUZZY] segment correction ran out of realized_locs; "
+                    "cursor=%d seg_len=%d total=%d",
+                    cursor,
+                    seg_len,
+                    realized_locs.numel(),
+                )
+                break
 
             new_locs = realized_locs[cursor : cursor + seg_len].to(torch.long)
             cursor += seg_len
@@ -2945,6 +2993,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"[FUZZY] Realized {total_realized} fuzzy tokens "
             f"({len(segments)} segments)"
         )
+
+        if cursor < realized_locs.numel():
+            self.token_to_kv_pool_allocator.free(realized_locs[cursor:])
 
     def _fuzzy_get_rotary_emb(self):
         """Resolve (rotary_emb, cos_sin_cache, is_neox_style, rotary_dim)."""

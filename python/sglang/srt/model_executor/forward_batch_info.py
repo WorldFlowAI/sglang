@@ -499,13 +499,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
-        # Populate fuzzy match info from the first request (single-request
-        # batch assumption). ``cache_fuzzy_matched_len`` is the gate: it is
-        # zeroed by the RoPE-correction path after the first chunk realizes
-        # the donor KV, so subsequent chunks of a chunked prefill see zero
-        # and skip the correction. Without this guard, the segments path
-        # would re-enter with realized_locs already cleared, alloc fresh
-        # slots, and orphan the first-chunk allocations.
+        # Keep legacy fuzzy fields populated from the first request for
+        # observability/backward compatibility. ModelRunner reads the
+        # per-request fields directly so multi-request prefill batches are not
+        # limited by these first-request fields.
         if batch.reqs and len(batch.reqs) > 0:
             ret.reqs = batch.reqs
             first_req = batch.reqs[0]

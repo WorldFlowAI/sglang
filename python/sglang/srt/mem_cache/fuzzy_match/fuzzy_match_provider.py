@@ -256,6 +256,8 @@ class FuzzyMatchProvider(ABC):
         self,
         prompt_token_ids: List[int],
         already_matched_len: int,
+        request=None,
+        extra_key=None,
     ) -> Optional[FuzzyMatchResult]:
         """Called when exact prefix matching falls short.
         
@@ -263,6 +265,11 @@ class FuzzyMatchProvider(ABC):
             prompt_token_ids: Complete token IDs of the current prompt.
             already_matched_len: Number of tokens already matched by
                 the exact radix tree (n in the design).
+            request: Optional request object. Semantic providers use this
+                to access a tokenizer for query embedding text.
+            extra_key: Optional namespace key (LoRA/cache salt/etc.) that
+                must isolate fuzzy donor lookup the same way exact radix
+                lookup does.
                 
         Returns:
             FuzzyMatchResult if a match is found, None otherwise.
