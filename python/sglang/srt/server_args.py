@@ -369,24 +369,13 @@ class ServerArgs:
     enable_fuzzy_match: bool = False
     fuzzy_min_match_length: int = 16
     fuzzy_semantic_threshold: float = 0.60
-    fuzzy_match_provider: str = "TokenBlockMatch"
+    fuzzy_match_provider: str = "SemanticEmbedding"
     cache_fuzzy_results: bool = True
-    fuzzy_eviction_policy: str = "LRU"
-    fuzzy_non_prefix_max_entries: int = 10000
-    fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
 
-    # SemanticEmbedding-specific (ignored when fuzzy_match_provider != "SemanticEmbedding").
-    # SemanticEmbedding is process-local: in-process MiniLM embedding, numpy
-    # donor store. No remote backend.
-    embedding_use_gpu: bool = True
+    # SemanticEmbedding-specific.
     fuzzy_model_arch: Optional[str] = None
-    enable_bathtub: bool = True
-    fuzzy_top_k: int = 5
     fuzzy_min_reuse_ratio: float = 0.50
-    fuzzy_min_cached_tokens: int = 0
-    quality_gate_ppl_threshold: float = 1.065
-    fuzzy_discovery_only: bool = False
     
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -4386,7 +4375,10 @@ class ServerArgs:
             "--fuzzy-min-match-length",
             type=int,
             default=ServerArgs.fuzzy_min_match_length,
-            help="Minimum number of tokens that must be matched for fuzzy matching to trigger.",
+            help=(
+                "Minimum token span a fuzzy provider may reuse. Partial "
+                "exact anchors shorter than this are skipped."
+            ),
         )
         parser.add_argument(
             "--fuzzy-semantic-threshold",
@@ -4394,7 +4386,7 @@ class ServerArgs:
             default=ServerArgs.fuzzy_semantic_threshold,
             help=(
                 "Cosine-similarity threshold for SemanticEmbedding matches "
-                "(0.0 - 1.0). Ignored by TokenBlockMatch. Higher = stricter "
+                "(0.0 - 1.0). Higher = stricter "
                 "(fewer matches, higher precision); lower = more permissive. "
                 "Below ~0.50 alignment quality drops quickly."
             ),
@@ -4403,7 +4395,7 @@ class ServerArgs:
             "--fuzzy-match-provider",
             type=str,
             default=ServerArgs.fuzzy_match_provider,
-            choices=["TokenBlockMatch", "SemanticEmbedding"],
+            choices=["SemanticEmbedding"],
             help="Provider class for fuzzy matching logic.",
         )
         parser.add_argument(
@@ -4412,35 +4404,10 @@ class ServerArgs:
             help="Cache fuzzy match results for future reuse.",
         )
         parser.add_argument(
-            "--fuzzy-eviction-policy",
-            type=str,
-            choices=RADIX_EVICTION_POLICY_CHOICES,
-            default=ServerArgs.fuzzy_eviction_policy,
-            help="Eviction policy for fuzzy radix tree.",
-        )
-        parser.add_argument(
-            "--fuzzy-non-prefix-max-entries",
-            type=int,
-            default=ServerArgs.fuzzy_non_prefix_max_entries,
-            help="Maximum entries in non-prefix store.",
-        )
-        parser.add_argument(
-            "--fuzzy-block-size",
-            type=int,
-            default=ServerArgs.fuzzy_block_size,
-            help="Block size for TokenBlockMatchProvider (tokens per block).",
-        )
-        parser.add_argument(
             "--embedding-model-name",
             type=str,
             default=ServerArgs.embedding_model_name,
             help="Embedding model name for SemanticEmbeddingProvider.",
-        )
-        parser.add_argument(
-            "--no-embedding-gpu",
-            dest="embedding_use_gpu",
-            action="store_false",
-            help="Force the SemanticEmbeddingProvider's MiniLM embedder onto CPU.",
         )
         parser.add_argument(
             "--fuzzy-model-arch",
@@ -4450,45 +4417,10 @@ class ServerArgs:
                  "preset selector (e.g. 'llama', 'qwen2.5-7b').",
         )
         parser.add_argument(
-            "--no-bathtub",
-            dest="enable_bathtub",
-            action="store_false",
-            help="Disable per-layer bathtub recomputation in SemanticEmbeddingProvider.",
-        )
-        parser.add_argument(
-            "--fuzzy-top-k",
-            type=int,
-            default=ServerArgs.fuzzy_top_k,
-            help="Top-K candidates pulled from the donor store before alignment.",
-        )
-        parser.add_argument(
             "--fuzzy-min-reuse-ratio",
             type=float,
             default=ServerArgs.fuzzy_min_reuse_ratio,
             help="Minimum reuse ratio (matched / prompt tokens) for a semantic hit.",
-        )
-        parser.add_argument(
-            "--fuzzy-min-cached-tokens",
-            type=int,
-            default=ServerArgs.fuzzy_min_cached_tokens,
-            help=(
-                "Minimum realized fuzzy tokens required before RadixCache "
-                "accepts a provider hit. Default 0 preserves legacy behavior."
-            ),
-        )
-        parser.add_argument(
-            "--quality-gate-ppl-threshold",
-            type=float,
-            default=ServerArgs.quality_gate_ppl_threshold,
-            help="Informational PPL guardrail (telemetry only).",
-        )
-        parser.add_argument(
-            "--fuzzy-discovery-only",
-            action="store_true",
-            help="Run the SemanticEmbedding pipeline for telemetry only -- "
-                 "do NOT inject donor KV into match_prefix's device_indices. "
-                 "Workaround for the upstream RadixCache _node_registry leak "
-                 "until the fix in _delete_leaf lands.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

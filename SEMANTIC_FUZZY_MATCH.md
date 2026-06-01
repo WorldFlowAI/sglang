@@ -6,58 +6,76 @@ without reading the diff cold.
 
 ## What this PR adds
 
-A second `FuzzyMatchProvider` implementation - `SemanticEmbedding` /
-SemBlend - built against the interface introduced in the
-`support fuzzy prefix match` work. SemanticEmbedding finds KV cache
-donors using semantic similarity (MiniLM ONNX embeddings + rapidfuzz
-N:M token alignment) instead of literal shared-prefix matching, so
-paraphrased prompts that share *meaning* but not *tokens* can reuse
-each other's KV cache.
+A `FuzzyMatchProvider` implementation, `SemanticEmbedding`, that wires
+SGLang's fuzzy prefix-matching path to SemBlend. SemanticEmbedding finds
+KV cache donors using semantic similarity (MiniLM ONNX embeddings +
+rapidfuzz N:M token alignment) instead of literal shared-prefix matching,
+so paraphrased prompts that share meaning but not tokens can reuse each
+other's KV cache.
 
-The PR also fixes four pool-slot accounting bugs in the shared
-`RadixCache` plumbing that we encountered while exercising the fuzzy
-path under sustained traffic. Three of the four affect both providers
-(TokenBlockMatch and SemanticEmbedding); the fourth is segments-only.
-All four end-state validations are described later in this doc.
+The PR also fixes pool-slot accounting bugs in the shared `RadixCache`
+plumbing that we encountered while exercising the fuzzy path under
+sustained traffic.
 
-## High-level architecture
+## End-to-end call chain
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ SGLang scheduler                                                │
-│   prepare_for_extend → match_prefix → forward_extend            │
-│                          │                  │                   │
-│                          ▼                  ▼                   │
-│          ┌─────────────────────┐  ┌───────────────────────────┐ │
-│          │ RadixCache          │  │ ModelRunner                │ │
-│          │  match_prefix(req) ─┼─▶│  _correct_fuzzy_kv_rope    │ │
-│          │  cache_finished_req │  │   _contiguous (TokenBlock) │ │
-│          │  cache_unfinished_  │  │   _segments  (SemanticEmb) │ │
-│          │   req               │  │  └─ rope_correction.py     │ │
-│          └─────────┬───────────┘  └───────────────────────────┘ │
-│                    │                                            │
-└────────────────────┼────────────────────────────────────────────┘
-                     ▼
-        ┌──────────────────────────┐
-        │ FuzzyMatchProvider       │  ← interface
-        │  match(prompt, ...)      │
-        │  on_donor_inserted(req)  │
-        └────────┬─────────────────┘
-                 │
-       ┌─────────┴───────────┐
-       ▼                     ▼
-┌──────────────────┐  ┌───────────────────────────────┐
-│ TokenBlockMatch  │  │ SemBlendProviderAdapter       │
-│ (in-tree, base)  │  │ (in semblend pip package)     │
-└──────────────────┘  │  embed → search → align       │
-                      │  → bathtub → plan → segments  │
-                      └───────────────────────────────┘
-```
+One accepted SemanticEmbedding hit flows through these layers:
 
-The provider returns either a contiguous donor span (TokenBlockMatch
-style) or a list of `FuzzyMatchSegment` entries with scattered N:M
-alignment (SemanticEmbedding). The cache and model layers handle both
-without per-model patches.
+1. `Req.init_next_round_input()` builds the cache lookup key from
+   `fill_ids[:max_prefix_len]` and calls
+   `RadixCache.match_prefix(MatchPrefixParams(key=RadixKey(...), req=self))`.
+2. `RadixCache.match_prefix()` performs the normal exact-prefix lookup first.
+   It only calls the fuzzy path when the exact prefix does not cover the lookup
+   key.
+3. `RadixCache.match_prefix_fuzzy()` applies the minimum-span guard for short
+   partial anchors, then calls
+   `SemanticEmbeddingProvider.match_on_prefix_miss(...)`.
+4. `SemanticEmbeddingProvider` decodes the unmatched suffix when a tokenizer is
+   available and delegates donor discovery to SemBlend's in-process adapter.
+5. SemBlend returns a `FuzzyMatchResult` with `cached_token_count`,
+   `kv_cache_indices`, `cached_start_pos`, optional `segments`,
+   `quality_signals`, and `donor_last_node_id`.
+6. `RadixCache.match_prefix()` owns cache-side acceptance. It validates the
+   donor TreeNode against `_node_registry`, rejects results whose
+   `kv_cache_indices` length does not match `cached_token_count`, pre-allocates
+   recipient-owned realization slots when relocation is needed, stores the
+   match on the `Req`, and `inc_lock_ref`s the donor TreeNode when a donor id is
+   present.
+7. `RadixCache.match_prefix()` returns
+   `MatchResult(device_indices=exact + fuzzy, fuzzy_matched_len=...,
+   cache_protected_len=...)`. `Req.init_next_round_input()` copies those fields
+   onto `req.prefix_indices`, `req.cache_fuzzy_matched_len`, and
+   `req.cache_protected_len`.
+8. `alloc_for_extend()` writes `req.prefix_indices` into `req_to_token_pool`
+   and allocates normal extend slots for the remaining suffix. At this point
+   relocated fuzzy entries still point at donor KV slots.
+9. At the start of `ModelRunner.forward_extend()`,
+   `_correct_fuzzy_kv_rope()` consumes the pre-allocated
+   `req.fuzzy_realized_locs`. For relocated contiguous matches it copies donor
+   KV into recipient-owned slots and applies RoPE correction from
+   `cached_start_pos` to the target prefix positions. For segment matches it
+   performs the same copy/RoPE operation per segment and frees any extend slots
+   displaced at segment target positions.
+10. The model forward computes the remaining suffix normally after
+    `req_to_token_pool` points at the correct recipient-owned slots.
+11. `RadixCache.cache_finished_req()` inserts the completed request into the
+    exact radix cache, lets the provider register it as a future donor through
+    `cache_on_request_finished()` / `on_donor_inserted()`, frees duplicate/tail
+    slots, and releases the donor lock with `dec_lock_ref`.
+
+Ownership boundaries:
+
+- Provider: donor discovery, semantic/alignment quality gates, donor metadata.
+- RadixCache: exact-prefix lookup, donor validation, donor lock refs,
+  realization-slot allocation, and exact-only fallback on provider/allocation
+  failure.
+- Scheduler / batch prep: prefix/extend accounting through
+  `MatchResult.device_indices`; no donor discovery and no RoPE work.
+- ModelRunner: KV copy and RoPE correction only; it consumes pre-allocated
+  realization slots and does not allocate them.
+- `cache_finished_req`: donor registration for future matches, duplicate/tail
+  slot release, and the matching `dec_lock_ref` for donor locks acquired in
+  `match_prefix`.
 
 ## What's added in this PR
 
@@ -138,9 +156,9 @@ asymmetric in the base - added on insert, never removed).
 `forward_extend`. It runs before the model's attention compute and
 fixes up donor KV in place at the recipient's positions:
 
-- **Contiguous path** (`_correct_fuzzy_kv_rope_contiguous`,
-  TokenBlockMatch): donor's KV is at a contiguous slot range; copy
-  with single `arange`-based RoPE delta correction; write to
+- **Contiguous path** (`_correct_fuzzy_kv_rope_contiguous`):
+  donor KV is at a contiguous slot range; copy with a single
+  `arange`-based RoPE delta correction; write to
   `req_to_token_pool[req_idx, exact:exact+fuzzy] = realized_locs`.
 - **Segments path** (`_correct_fuzzy_kv_rope_segments`,
   SemanticEmbedding): iterate segments. Per segment, slice
@@ -162,14 +180,10 @@ becomes model-agnostic again, the fuzzy correction works for any
 model whose attention reads from `req_to_token_pool`, and tests don't
 need the rotary kernels.
 
-### 5. New CLI flags (`server_args.py`)
+### 5. CLI flags for the initial landing (`server_args.py`)
 
 - `--enable-fuzzy-match` - gates the whole feature.
-- `--fuzzy-match-provider <TokenBlockMatch|SemanticEmbedding>`
-- `--fuzzy-discovery-only` - runs the provider but returns
-  `cached_token_count=0`, so no realization happens. Useful as a
-  safety valve while validating, and for users who want fuzzy-match
-  telemetry without the realization risk.
+- `--fuzzy-match-provider SemanticEmbedding`
 - `--fuzzy-semantic-threshold` / `--fuzzy-min-reuse-ratio` /
   `--fuzzy-min-match-length` - tunables for SemanticEmbedding.
 - `--fuzzy-model-arch` - string passed to the SemBlend pipeline so
@@ -203,14 +217,13 @@ before being fixed.
 
 **File**: `radix_cache.py:_delete_leaf`
 **Direction**: not a pool leak per se - Python dict bloat + stale
-NodeRef resolution.
+donor-node resolution.
 
 `_register_node` added entries on insert but `_delete_leaf` never
 removed them. Under sustained insert/evict traffic (which fuzzy
-exercises heavily), `_node_registry` grew without bound. The provider's
-`non_prefix_store.update_node_refs_on_split` could resolve to an
-already-evicted node. **Fix**: `self._node_registry.pop(node.id, None)`
-in `_delete_leaf`.
+exercises heavily), `_node_registry` grew without bound and provider
+matches could point at already-evicted nodes. **Fix**:
+`self._node_registry.pop(node.id, None)` in `_delete_leaf`.
 
 ### Bug B - Donor TreeNode not lock_ref'd
 
@@ -273,7 +286,7 @@ self.token_to_kv_pool_allocator.free(displaced_locs)
 req_to_token[req_idx, target_positions] = new_locs.to(req_to_token.dtype)
 ```
 
-The contiguous (TokenBlockMatch) path is unaffected - its
+The contiguous path is unaffected - its
 `device_indices` includes the donor's KV indices, so
 `alloc_for_extend` skips the fuzzy region entirely and the slots
 displaced in `_correct_fuzzy_kv_rope_contiguous` are donor-owned
@@ -284,39 +297,21 @@ displaced in `_correct_fuzzy_kv_rope_contiguous` are donor-owned
 End-to-end real-GPU benches on AWS EKS A10G (g5.xlarge) with
 code-overlay deploys pulling this branch fresh at pod startup.
 
-### 1.5B 3-way comparison (vanilla / TokenBlockMatch / SemanticEmbedding)
+### Concurrent donor-lock regression
 
-Same SGLang build for all three, longeval n=100 per variant.
+Ran the focused provider test in a Linux pod with Torch 2.9.1 so the
+Radix-backed path imports and does not skip:
 
-| Variant | HITs | Realized | Pool leaks | Job status |
-|---|---:|---:|---:|---|
-| vanilla | 2 | 0 | 0 | succeeded |
-| TokenBlockMatch | 4 | 2 | 0 | succeeded |
-| SemanticEmbedding | **33** | **37** | **0** | succeeded |
-
-The bug fixes don't regress vanilla or TokenBlockMatch behavior, and
-SemanticEmbedding produces ~9× more HITs than the reference provider
-on the same workload (longeval cross-instruction line retrieval).
-
-### TokenBlockMatch regression smoke (rebased branch, 7B-AWQ)
-
-Independent of the longeval bench, replayed Chenxin's
-`Draft_Prefix_Matching.md` § 7.2 case (`cache_start_pos=4` to register
-a segment, then a follow-up prompt with the same body after a
-different leading word). Captured from `sglang-server.log`:
-
-```
-[FUZZY RADIX] Fuzzy match success: cached=93, prompt=93, offset=3
-[FUZZY RADIX] match_prefix: exact=3, fuzzy=93, miss=16, total=112, \
-              cached_start_pos=0, realized_locs=pre-allocated
-[FUZZY] Realized 93 fuzzy tokens (contiguous): copied donor KV with \
-        RoPE correction from positions [0..92] to [3..95]
+```bash
+PYTHONPATH=python:test \
+  python -m pytest test/registered/unit/mem_cache/test_fuzzy_match_providers.py -q
 ```
 
-83 % of the follow-up prompt's tokens reused via the contiguous path;
-0 `pool memory leak detected` events; server status `ready` after the
-test. Confirms the rebase did not regress the `TokenBlockMatch` path
-or its `cache_start_pos` feature.
+Result: `2 passed`. The concurrency case creates one donor TreeNode,
+runs eight simultaneous fuzzy matches against that donor, verifies that
+each request points at the same donor node, verifies the donor
+`lock_ref` reaches the number of concurrent recipients, then releases
+each lock and verifies `lock_ref` returns to zero.
 
 ### 1.5B SemanticEmbedding deep-dive
 
@@ -393,10 +388,6 @@ python -m sglang.launch_server \
     --cache-fuzzy-results \
     --mem-fraction-static 0.75
 
-# To use TokenBlockMatch (the reference provider in this branch):
-#   --fuzzy-match-provider TokenBlockMatch
-# To run discovery-only (no realization):
-#   add --fuzzy-discovery-only
 ```
 
 The SemBlend Python package (`pip install 'semblend[onnx-gpu]>=0.3.12'`) supplies the
@@ -430,7 +421,6 @@ python -m sglang.launch_server \
     --fuzzy-min-match-length 1 \
     --fuzzy-semantic-threshold 0.60 \
     --fuzzy-min-reuse-ratio 0.50 \
-    --fuzzy-min-cached-tokens 1024 \
     --cache-fuzzy-results \
     --mem-fraction-static 0.75 \
     --port 8000 \
@@ -539,9 +529,8 @@ this PR preserves.
 
 The following examples demonstrate `SemanticEmbedding` fuzzy-match
 firing on paraphrased instructions over shared context. They mirror
-the shape of `Draft_Prefix_Matching.md` Section 7.2 (TokenBlockMatch
-case), substituting English prompts and the local Qwen2.5-7B-AWQ
-checkpoint.
+the shape of document-Q&A traffic using English prompts and the local
+Qwen2.5-7B-AWQ checkpoint.
 
 **Launch the server:**
 
@@ -672,10 +661,9 @@ realizes per-chunk matches via N:M alignment.
   request through the system to register a donor before fuzzy match
   can fire. Production traffic patterns naturally satisfy this; the
   seed-then-variant pattern in these examples does too.
-- **Per-chunk content alignment**: matching is at the chunk level
-  (default `--fuzzy-block-size 16` tokens per chunk). Paraphrases that
-  preserve content tokens inside chunks align better than paraphrases
-  that shift token offsets significantly.
+- **Per-chunk content alignment**: matching is at the chunk level.
+  Paraphrases that preserve content tokens inside chunks align better
+  than paraphrases that shift token offsets significantly.
 - **Threshold tuning**: `--fuzzy-semantic-threshold` controls
   embedding-similarity strictness; `--fuzzy-min-reuse-ratio` is the
   minimum chunk-overlap ratio required to surface a match. Lowering

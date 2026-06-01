@@ -11,13 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Embedding-based semantic fuzzy-match provider.
-
-Wires SGLang's ``FuzzyMatchProvider`` interface to the in-process
-embedding + alignment pipeline shipped in the ``semblend`` pip package.
-The dependency is imported lazily so SGLang installs that do not select
-``fuzzy_match_provider="SemanticEmbedding"`` never need it on disk.
-"""
+"""Embedding-based fuzzy-match provider backed by SemBlend."""
 
 from __future__ import annotations
 
@@ -39,13 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class SemanticEmbeddingProvider(FuzzyMatchProvider):
-    """Embedding-based semantic fuzzy match.
-
-    Construction lazily imports the ``semblend`` package; an unselected
-    ``SemanticEmbedding`` does not require the package to be installed.
-    The provider is process-local (in-process embedding + numpy ANN); no
-    network or service dependency.
-    """
+    """Lazy SemBlend wrapper for SGLang's fuzzy-match interface."""
 
     _MIN_SEMBLEND_VERSION = "0.3.12"
 
@@ -86,25 +74,19 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "min_similarity": config.fuzzy_semantic_threshold,
                 "min_reuse_ratio": config.fuzzy_min_reuse_ratio,
                 "min_match_length": config.fuzzy_min_match_length,
-                "max_entries": config.fuzzy_non_prefix_max_entries,
+                "max_entries": config.semantic_max_entries,
                 "block_size": config.fuzzy_block_size,
-                "embedding_use_gpu": config.embedding_use_gpu,
                 "embedding_model_name": config.embedding_model_name,
                 "model_arch": config.model_arch,
-                "enable_bathtub": config.enable_bathtub,
-                "top_k": config.fuzzy_top_k,
-                "quality_gate_ppl_threshold": config.quality_gate_ppl_threshold,
-                "discovery_only": config.discovery_only,
             }
         )
         self._adapter = self._adapter_cls(config=self._adapter_config)
         logger.info(
             "SemanticEmbeddingProvider initialized: threshold=%.2f, "
-            "min_reuse=%.2f, model_arch=%s, enable_bathtub=%s",
+            "min_reuse=%.2f, model_arch=%s",
             config.fuzzy_semantic_threshold,
             config.fuzzy_min_reuse_ratio,
             config.model_arch,
-            config.enable_bathtub,
         )
 
     # ------------------------------------------------------------------
@@ -183,25 +165,10 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         )
         if adapter_result is None:
             return None
-        min_cached = getattr(self.config, "fuzzy_min_cached_tokens", 0)
-        if adapter_result.cached_token_count < min_cached:
-            logger.info(
-                "[FUZZY] SemanticEmbeddingProvider rejected small realized "
-                "block: cached=%d < fuzzy_min_cached_tokens=%d",
-                adapter_result.cached_token_count,
-                min_cached,
-            )
-            return None
         return _adapter_to_sglang_result(adapter_result)
 
     def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
-        """Forward the donor's TreeNode id from RadixCache to the adapter.
-
-        Called by RadixCache.cache_finished_req after the donor's KV has been
-        inserted. Without this, the donor's slots aren't lock_ref'd at match
-        time and LRU eviction frees them while a recipient request is
-        consuming them, tripping the SGLang pool-leak detector.
-        """
+        """Forward the donor's TreeNode id from RadixCache to the adapter."""
         request_id = getattr(request, "rid", None) or getattr(request, "request_id", None)
         if request_id is None:
             return
@@ -211,13 +178,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         )
 
     def on_cache_reset(self) -> None:
-        """Clear provider-side donor state after SGLang flushes radix/KV cache.
-
-        Older SemBlend adapters did not expose a public clear API. When it is
-        missing, reinstantiating the adapter is the safest way to clear both the
-        donor handle map and embedding donor store so no later fuzzy match can
-        point at KV slots or radix nodes invalidated by ``/flush_cache``.
-        """
+        """Clear provider-side donor state after SGLang flushes the cache."""
         old_adapter = getattr(self, "_adapter", None)
         clear = getattr(old_adapter, "clear", None)
         if callable(clear):
@@ -245,12 +206,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     # ------------------------------------------------------------------
 
     def _decode(self, request, token_ids: List[int]) -> str:
-        """Decode tokens to text via the request's tokenizer if available.
-
-        SGLang's scheduler plumbs the tokenizer through several layers; we
-        accept best-effort here. The adapter has its own tokenizer fallback,
-        so this is a fast-path optimization, not a hard requirement.
-        """
+        """Decode tokens via the request tokenizer when available."""
         tokenizer = None
         if request is not None:
             tokenizer = getattr(request, "tokenizer", None)

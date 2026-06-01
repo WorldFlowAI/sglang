@@ -57,7 +57,6 @@ python -m sglang.launch_server \
   --fuzzy-min-match-length 1 \
   --fuzzy-semantic-threshold 0.50 \
   --fuzzy-min-reuse-ratio 0.50 \
-  --fuzzy-min-cached-tokens 1024 \
   --cache-fuzzy-results \
   --chunked-prefill-size 4096 \
   --mem-fraction-static 0.70 \
@@ -121,8 +120,8 @@ Expected aggregate shape:
 - `reuse_diagnostics` may show thousands of internally reusable tokens.
 - `cached_tokens_in_warm` may stay much lower because current SGLang realizes
   one contiguous fuzzy block.
-- With `--fuzzy-min-cached-tokens 1024`, low-value fragmented matches should
-  be rejected instead of producing misleading slow warm runs.
+- Low-value fragmented matches should be rejected by `fuzzy_min_match_length`
+  and `fuzzy_min_reuse_ratio` instead of producing misleading slow warm runs.
 
 ## Re-score An Existing Run
 

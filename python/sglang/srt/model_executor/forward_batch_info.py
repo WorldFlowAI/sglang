@@ -439,13 +439,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For fuzzy prefix matching
     fuzzy_matched_len: int = 0  # Number of tokens from fuzzy match
     fuzzy_cached_start_pos: int = 0  # Original position where fuzzy KV was computed
-    # Optional N:M segments - set by SemanticEmbedding-style providers; when
-    # populated, model_runner._correct_fuzzy_kv_rope iterates per-segment.
+    # Optional N:M segments from semantic providers.
     fuzzy_segments: Optional[list] = None
-    # Optional per-layer recomputation mask; element ``i`` True means layer
-    # ``i`` recomputes the matched tokens instead of reusing donor KV.
     fuzzy_layer_recompute_mask: Optional[list] = None
-    # Reference to req objects (for fuzzy realization flag propagation)
     reqs: Optional[list] = None
 
     @classmethod
@@ -499,10 +495,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
-        # Keep legacy fuzzy fields populated from the first request for
-        # observability/backward compatibility. ModelRunner reads the
-        # per-request fields directly so multi-request prefill batches are not
-        # limited by these first-request fields.
+        # Legacy first-request fields; ModelRunner uses per-request state.
         if batch.reqs and len(batch.reqs) > 0:
             ret.reqs = batch.reqs
             first_req = batch.reqs[0]

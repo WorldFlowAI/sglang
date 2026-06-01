@@ -3023,7 +3023,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
-        # Correct RoPE on fuzzy-matched K values by allocating new pool slots
+        # Correct RoPE on fuzzy-matched K values using pre-allocated slots.
         self._correct_fuzzy_kv_rope(forward_batch)
 
         kwargs = {}

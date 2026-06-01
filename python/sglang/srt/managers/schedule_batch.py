@@ -732,24 +732,12 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-        # The fuzzy-matched prefix length. These indices come from another
-        # request's tree nodes via non_prefix_store and should NOT be freed
-        # in cache_finished_req since they're not this request's own allocation.
+        # Number of fuzzy-matched tokens appended to prefix_indices.
         self.cache_fuzzy_matched_len: int = 0
-        # Donor TreeNode (in radix tree) lock_ref'd at fuzzy match time.
-        # Set by RadixCache.match_prefix on a successful fuzzy match; released
-        # by RadixCache.cache_finished_req. Without this, the donor's KV
-        # slots can be LRU-evicted while this request is still consuming
-        # them, causing the SGLang runtime pool-leak detector to fire.
+        # Donor TreeNode protected until this request finishes.
         self.fuzzy_donor_node: Any = None
 
-        # Pool slots pre-allocated by ``RadixCache.match_prefix`` for the
-        # fuzzy realization (KV copy with RoPE delta). Consumed by
-        # ``model_runner._correct_fuzzy_kv_rope``, which writes them into
-        # ``req_to_token_pool`` and clears this field. If the field is
-        # still set when ``cache_finished_req`` runs, the realization
-        # never executed (e.g. the request was aborted before forward),
-        # and the slots are freed there as a defensive cleanup.
+        # Recipient-owned slots reserved for RoPE-corrected donor KV.
         self.fuzzy_realized_locs: Any = None
 
         # Whether or not if it is chunked. It increments whenever
@@ -1037,7 +1025,7 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
-            # Track fuzzy-matched length to avoid freeing these indices
+            # Track fuzzy length for cache cleanup and RoPE realization.
             if match_result.fuzzy_matched_len is not None:
                 self.cache_fuzzy_matched_len = match_result.fuzzy_matched_len
             else:
@@ -1236,11 +1224,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
-        # Note: fuzzy_donor_node is intentionally not reset on retraction -
-        # it's released by cache_finished_req when the request actually
-        # finishes. Retraction doesn't run cache_finished_req, so the
-        # donor remains lock_ref'd until the retracted request is finalized
-        # later (which still goes through cache_finished_req).
+        # Keep fuzzy_donor_node locked until cache_finished_req releases it.
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True

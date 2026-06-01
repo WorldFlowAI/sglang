@@ -28,7 +28,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -339,7 +339,7 @@ class RadixCache(BasePrefixCache):
 
         self.evictable_leaves = set()
         
-        # Node registry: maps node_id -> TreeNode for non_prefix_store to resolve pool indices
+        # Node registry used to validate and lock donor TreeNodes.
         self._node_registry: Dict[int, TreeNode] = {}
         
         # Fuzzy matching support
@@ -401,10 +401,6 @@ class RadixCache(BasePrefixCache):
         self.fuzzy_config = config
         self.fuzzy_match_provider = provider
         self._fuzzy_cache_enabled = config.cache_fuzzy_results
-        
-        # Pass node registry to non_prefix_store for resolving pool indices
-        if hasattr(self.fuzzy_match_provider, 'non_prefix_store'):
-            self.fuzzy_match_provider.non_prefix_store.set_node_registry(self._node_registry)
         
         logger.info(
             f"Fuzzy matching initialized with provider={config.fuzzy_match_provider}, "
@@ -508,28 +504,6 @@ class RadixCache(BasePrefixCache):
             
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
-                min_cached = getattr(
-                    self.fuzzy_config,
-                    "fuzzy_min_cached_tokens",
-                    0,
-                )
-                if fuzzy_matched_len < min_cached:
-                    rid = (
-                        getattr(params.req, "rid", None)
-                        if params.req is not None
-                        else None
-                    )
-                    logger.info(
-                        f"[FUZZY RADIX] dropping fuzzy match: rid={rid} "
-                        f"cached={fuzzy_matched_len} < "
-                        f"fuzzy_min_cached_tokens={min_cached}"
-                    )
-                    return MatchResult(
-                        device_indices=value,
-                        last_device_node=last_node,
-                        last_host_node=last_node,
-                    )
-
                 donor_last_node_id = getattr(
                     fuzzy_result, "donor_last_node_id", None
                 )
@@ -551,15 +525,8 @@ class RadixCache(BasePrefixCache):
                         last_host_node=last_node,
                     )
 
-                # Reserve realization slots up front. _correct_fuzzy_kv_rope
-                # consumes from req.fuzzy_realized_locs; if we let it
-                # allocate inside the forward pass, an alloc failure would
-                # leave req_to_token_pool referencing donor slots after
-                # state has already been committed here. Allocating now
-                # makes the capacity check the first mutating step.
-                # Skip the alloc when donor positions already match the
-                # recipient's target (no copy needed); scattered N:M
-                # results always need fresh slots.
+                # Allocate before mutating request state so capacity failure
+                # can fall back to exact-only cleanly.
                 needs_realization = fuzzy_matched_len > 0 and (
                     getattr(fuzzy_result, "segments", None) is not None
                     or fuzzy_result.cached_start_pos != exact_matched_len
@@ -581,8 +548,6 @@ class RadixCache(BasePrefixCache):
                             last_device_node=last_node,
                             last_host_node=last_node,
                         )
-                    # Free any leftover from a prior chunked/retracted
-                    # match before stashing the new block.
                     prev_locs = getattr(params.req, "fuzzy_realized_locs", None)
                     if prev_locs is not None:
                         try:
@@ -599,21 +564,14 @@ class RadixCache(BasePrefixCache):
                     f"realized_locs={'pre-allocated' if realized_locs is not None else 'none'}"
                 )
 
-                # The merged value still references the donor's slots;
-                # the copy + RoPE correction into realized_locs runs in
-                # model_runner._correct_fuzzy_kv_rope.
                 fuzzy_kv_indices = torch.tensor(
                     fuzzy_result.kv_cache_indices,
                     device=value.device,
                     dtype=value.dtype,
                 )
 
-                # Provider contract: kv_cache_indices length must equal
-                # cached_token_count. If it is shorter (e.g. an empty
-                # tensor returned for a multi-segment match), the merged
-                # device_indices below would mis-report the cached prefix
-                # length to the scheduler, silently disabling KV reuse on
-                # the fuzzy region.
+                # device_indices is prefix-shaped; do not accept a provider
+                # result that cannot be represented by that contract.
                 if len(fuzzy_kv_indices) != fuzzy_matched_len:
                     logger.warning(
                         f"[FUZZY RADIX] provider returned "
@@ -637,9 +595,7 @@ class RadixCache(BasePrefixCache):
                 if params.req is not None:
                     params.req.fuzzy_match_result = fuzzy_result
 
-                # Lock the donor TreeNode so LRU eviction can't free the
-                # slots in fuzzy_kv_indices before _correct_fuzzy_kv_rope
-                # copies them. Released in cache_finished_req.
+                # Protect donor slots until the recipient request finishes.
                 if (
                     params.req is not None
                     and getattr(fuzzy_result, "donor_last_node_id", None) is not None
@@ -716,10 +672,6 @@ class RadixCache(BasePrefixCache):
                 extra_key=params.key.extra_key,
             )
             
-            # Note: non_prefix_store entries don't need additional locking here.
-            # Node references are resolved from the radix tree's node registry,
-            # and the radix tree manages node lifecycle independently.
-            
             if result is not None:
                 rid = getattr(params.req, "rid", None) if params.req is not None else None
                 quality = getattr(result, "quality_signals", None)
@@ -775,15 +727,7 @@ class RadixCache(BasePrefixCache):
         # Register the root node (always registered)
         self._register_node(self.root_node)
 
-        # Resolve the deepest TreeNode for the just-inserted ``key`` via a
-        # side-effect-free tree walk. The id is surfaced as
-        # ``last_node_id`` so RadixCache.match_prefix's fuzzy path can
-        # ``inc_lock_ref`` the donor TreeNode at match time and prevent
-        # LRU eviction while a recipient request is consuming its KV.
-        # Computing this here (rather than threading it back through
-        # ``_insert_helper``'s return) preserves the helper's original
-        # int-return ABI so subclasses overriding ``_insert_helper`` are
-        # not forced to update their signature.
+        # Surface the leaf id without changing _insert_helper's ABI.
         last_node = self._find_leaf_for_key(key)
 
         return InsertResult(
@@ -792,17 +736,7 @@ class RadixCache(BasePrefixCache):
         )
 
     def _find_leaf_for_key(self, key: RadixKey) -> Optional[TreeNode]:
-        """Walk the radix tree from root following ``key`` and return the leaf.
-
-        Side-effect free: does not update access times, does not split
-        nodes, does not allocate. Assumes ``key`` was just successfully
-        inserted via ``_insert_helper`` so the path is expected to exist;
-        returns the deepest reachable node if the trie shape is
-        unexpected (e.g. a downstream subclass diverged from the base's
-        insert semantics).
-
-        Returns ``self.root_node`` when ``key`` is empty.
-        """
+        """Return the deepest node currently reachable by key."""
         node = self.root_node
         if len(key) == 0:
             return node
@@ -821,7 +755,7 @@ class RadixCache(BasePrefixCache):
         return node
     
     def _register_node(self, node: TreeNode):
-        """Register a TreeNode in the node registry for reference resolution by non_prefix_store."""
+        """Register a TreeNode for donor validation and lock refs."""
         self._node_registry[node.id] = node
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -830,8 +764,7 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        # Reclaim any pre-allocated realization slots that the forward
-        # pass did not consume (aborted request, partial segments).
+        # Reclaim realization slots if the forward pass never consumed them.
         leftover = getattr(req, "fuzzy_realized_locs", None)
         if leftover is not None:
             try:
@@ -871,11 +804,7 @@ class RadixCache(BasePrefixCache):
             )
             new_prefix_len = result.prefix_len
 
-            # Cache to fuzzy side stores after radix insert, but before freeing
-            # any duplicate or tail indices. TokenBlock needs the inserted
-            # TreeNode to create valid NodeRefs; SemanticEmbedding snapshots the
-            # KV index handle here so later request-pool mutations cannot corrupt
-            # donor handles.
+            # Register fuzzy donors after radix insert, before freeing slots.
             if self._fuzzy_cache_enabled:
                 try:
                     cache_start = getattr(req, "cache_start_pos", None)
@@ -899,8 +828,7 @@ class RadixCache(BasePrefixCache):
                     import traceback
                     logger.debug(traceback.format_exc())
 
-            # Hand the inserted node id to the fuzzy provider so
-            # subsequent donor lookups can resolve a stable NodeRef.
+            # Let providers map request id -> radix TreeNode id.
             if (
                 self._fuzzy_cache_enabled
                 and result.last_node_id is not None
@@ -1067,7 +995,7 @@ class RadixCache(BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1134,15 +1062,6 @@ class RadixCache(BasePrefixCache):
         child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        # Update NodeRefs in non_prefix_store to reflect the split.
-        # child.id is the old node (now holds suffix), new_node.id is the new node (holds prefix).
-        if self.fuzzy_match_provider is not None and hasattr(self.fuzzy_match_provider, 'non_prefix_store'):
-            self.fuzzy_match_provider.non_prefix_store.update_node_refs_on_split(
-                old_node_id=child.id,
-                new_node_id=new_node.id,
-                split_len=split_len,
-            )
-
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
@@ -1166,15 +1085,7 @@ class RadixCache(BasePrefixCache):
         priority: int = 0,
         chunked: bool = False,
     ) -> int:
-        """Insert ``key``/``value`` into the radix tree rooted at ``node``.
-
-        Returns the total prefix length matched against existing nodes.
-        The deepest inserted/touched node is reachable via
-        ``_find_leaf_for_key(key)`` from ``insert()``; we deliberately do
-        NOT thread it back through the return value here so the helper's
-        original int-return ABI stays stable for subclasses that override
-        ``_insert_helper``.
-        """
+        """Insert key/value and return the matched prefix length."""
         # Convert None priority to 0
         if priority is None:
             priority = 0

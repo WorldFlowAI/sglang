@@ -2,94 +2,18 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import types
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
-from sglang.srt.mem_cache.fuzzy_match.non_prefix_store import (
-    NodeRef,
-    NonPrefixKVStore,
-)
-from sglang.srt.mem_cache.fuzzy_match.token_block_match import TokenBlockMatchProvider
+from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import FuzzyMatchResult
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
-
-
-class TestNonPrefixKVStore(unittest.TestCase):
-    def test_eviction_keeps_block_index_entry_ids_valid(self):
-        store = NonPrefixKVStore(max_entries=2, block_size=2)
-        store.insert([0, 1, 2, 3], [NodeRef(1, 0, 4)], extra_key=None)
-        store.insert([10, 11, 12, 13], [NodeRef(2, 0, 4)], extra_key=None)
-        store.insert([20, 21, 22, 23], [NodeRef(3, 0, 4)], extra_key=None)
-
-        self.assertEqual([entry.id for entry in store.entries], [1, 2])
-
-        matches = store.find_by_block_hash(
-            query_tokens=[20, 21, 22, 23],
-            min_length=2,
-        )
-
-        self.assertTrue(matches)
-        self.assertEqual(matches[0][1].id, 2)
-
-    def test_clear_removes_entries_and_indexes(self):
-        store = NonPrefixKVStore(max_entries=2, block_size=2)
-        store.insert([0, 1, 2, 3], [NodeRef(1, 0, 4)], extra_key="tenant")
-
-        store.clear()
-
-        self.assertEqual(store.entries, [])
-        self.assertEqual(dict(store.block_index), {})
-        self.assertEqual(store.total_entries, 0)
-
-
-class TestTokenBlockMatchProvider(unittest.TestCase):
-    def _config(self):
-        return FuzzyMatchConfig(
-            enable_fuzzy_match=True,
-            fuzzy_match_provider="TokenBlockMatch",
-            fuzzy_min_match_length=2,
-            fuzzy_block_size=2,
-            fuzzy_non_prefix_max_entries=8,
-        )
-
-    def test_on_cache_reset_clears_non_prefix_store(self):
-        provider = TokenBlockMatchProvider(self._config())
-        provider.non_prefix_store.insert(
-            [0, 1, 2, 3],
-            [NodeRef(1, 0, 4)],
-            extra_key="tenant",
-        )
-
-        provider.on_cache_reset()
-
-        self.assertEqual(provider.non_prefix_store.total_entries, 0)
-        self.assertEqual(dict(provider.non_prefix_store.block_index), {})
-
-    def test_match_passes_extra_key_to_store(self):
-        provider = TokenBlockMatchProvider(self._config())
-        seen = {}
-
-        def fake_find_by_block_hash(query_tokens, min_length, extra_key=None):
-            seen["query_tokens"] = list(query_tokens)
-            seen["min_length"] = min_length
-            seen["extra_key"] = extra_key
-            return []
-
-        provider.non_prefix_store.find_by_block_hash = fake_find_by_block_hash
-
-        result = provider.match_on_prefix_miss(
-            prompt_token_ids=[99, 0, 1, 2, 3],
-            already_matched_len=1,
-            extra_key="tenant-a",
-        )
-
-        self.assertIsNone(result)
-        self.assertEqual(seen["query_tokens"], [0, 1, 2, 3])
-        self.assertEqual(seen["min_length"], 2)
-        self.assertEqual(seen["extra_key"], "tenant-a")
 
 
 class TestSemanticEmbeddingProvider(unittest.TestCase):
@@ -191,6 +115,85 @@ class TestSemanticEmbeddingProvider(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = module
+
+
+class TestRadixFuzzyConcurrency(unittest.TestCase):
+    def test_concurrent_matches_lock_same_donor_node(self):
+        try:
+            from sglang.srt.mem_cache.base_prefix_cache import (
+                InsertParams,
+                MatchPrefixParams,
+            )
+            from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+        except TypeError as e:
+            self.skipTest(f"local torch custom-op registration unavailable: {e}")
+
+        cache = RadixCache.create_simulated()
+        donor_insert = cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+            )
+        )
+        donor = cache._node_registry[donor_insert.last_node_id]
+
+        class FakeProvider:
+            def cache_on_request_finished(self, *args, **kwargs):
+                return False
+
+            def on_cache_reset(self):
+                return None
+
+            def match_on_prefix_miss(
+                self,
+                prompt_token_ids,
+                already_matched_len,
+                request=None,
+                extra_key=None,
+            ):
+                return FuzzyMatchResult(
+                    cached_token_count=2,
+                    cached_token_ids=[1, 2],
+                    prompt_token_count=2,
+                    kv_cache_indices=torch.tensor([10, 11], dtype=torch.int64),
+                    position_offset=already_matched_len,
+                    cached_start_pos=already_matched_len,
+                    donor_last_node_id=donor_insert.last_node_id,
+                )
+
+        config = FuzzyMatchConfig(
+            enable_fuzzy_match=True,
+            cache_fuzzy_results=False,
+            fuzzy_min_match_length=1,
+        )
+        cache.init_fuzzy_match(config, FakeProvider())
+
+        class Req:
+            def __init__(self, rid):
+                self.rid = rid
+
+        reqs = [Req(f"req-{i}") for i in range(8)]
+
+        def run_match(req):
+            result = cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey([90, 91, 92]),
+                    req=req,
+                )
+            )
+            self.assertEqual(result.fuzzy_matched_len, 2)
+            self.assertIs(req.fuzzy_donor_node, donor)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(run_match, reqs))
+
+        self.assertEqual(donor.lock_ref, len(reqs))
+
+        for req in reqs:
+            cache.dec_lock_ref(req.fuzzy_donor_node)
+            req.fuzzy_donor_node = None
+
+        self.assertEqual(donor.lock_ref, 0)
 
 
 if __name__ == "__main__":

@@ -68,11 +68,7 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
-    # ID of the deepest TreeNode created/touched by this insert (resolvable via
-    # ``radix_tree._node_registry``). Set by RadixCache.insert; used by
-    # cache_finished_req to notify FuzzyMatchProvider of the donor's last_node
-    # so the provider can populate FuzzyMatchResult.donor_last_node_id at match
-    # time (see fuzzy_match_provider.on_donor_inserted).
+    # Deepest TreeNode created/touched by this insert.
     last_node_id: Optional[int] = None
 
 
