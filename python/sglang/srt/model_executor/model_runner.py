@@ -2792,6 +2792,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     req,
                     realized_locs,
                     req_idx,
+                    prefix_len,
                     segments,
                 )
             else:
@@ -2826,8 +2827,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         exact_matched_len = prefix_len - num_fuzzy
 
-        # No copy needed when donor positions already align with target.
-        if cached_start_pos == exact_matched_len:
+        # No copy needed when donor positions already align with target, unless
+        # this is semantic request-local reuse. Request-local reuse must copy
+        # donor KV into recipient-owned slots so cleanup cannot free donor KV.
+        if cached_start_pos == exact_matched_len and not getattr(
+            req, "semantic_kv_request_local", False
+        ):
             if realized_locs is not None:
                 self.token_to_kv_pool_allocator.free(realized_locs)
             return
@@ -2876,7 +2881,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             new_locs=new_fuzzy_locs,
             old_positions=old_positions,
             new_positions=new_positions,
-            layer_recompute_mask=layer_recompute_mask,
+            # This backend consumes donor spans as realized prefix KV. It does
+            # not yet have a layer-selective recompute pass for donated
+            # positions, so honoring a bathtub recompute mask here would zero
+            # layers without recomputing them.
+            layer_recompute_mask=None,
         )
 
         # Point req_to_token_pool at the new recipient-owned slots.
@@ -2884,6 +2893,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.req_to_token_pool.req_to_token[
             req_idx, exact_matched_len:prefix_len
         ] = new_fuzzy_locs
+        req.prefix_indices[exact_matched_len:prefix_len] = new_fuzzy_locs.to(
+            device=req.prefix_indices.device,
+            dtype=req.prefix_indices.dtype,
+        )
 
         logger.info(
             f"[FUZZY] Realized {num_fuzzy} fuzzy tokens (contiguous): "
@@ -2899,6 +2912,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         req,
         realized_locs,
         req_idx: int,
+        prefix_len: int,
         segments,
     ):
         """N:M alignment with scattered target positions.
@@ -2968,9 +2982,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             new_locs = realized_locs[cursor : cursor + seg_len].to(torch.long)
             cursor += seg_len
 
-            # Free the extend slots the scheduler placed at these
-            # target positions before overwriting req_to_token.
-            displaced = req_to_token[req_idx, target_positions].to(torch.int64)
+            # Free only extend slots the scheduler placed at target positions.
+            # Prefix-shaped semantic phases initially point at donor slots, not
+            # recipient-owned extend slots, so freeing them would corrupt the
+            # donor request's KV ownership.
+            displaced_mask = target_positions >= prefix_len
+            displaced = req_to_token[req_idx, target_positions[displaced_mask]].to(
+                torch.int64
+            )
             if displaced.numel() > 0:
                 self.token_to_kv_pool_allocator.free(displaced)
 
@@ -2981,12 +3000,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_locs=new_locs,
                 old_positions=donor_positions,
                 new_positions=target_positions,
-                layer_recompute_mask=seg.layer_recompute_mask,
+                # Do not zero bathtub-selected layers in the dense realized
+                # prefix path. True quality-first layer recompute needs a
+                # dedicated backend pass for these donated positions.
+                layer_recompute_mask=None,
             )
 
             req_to_token[req_idx, target_positions] = new_locs.to(
                 req_to_token.dtype
             )
+            prefix_mask = target_positions < prefix_len
+            if prefix_mask.any():
+                prefix_positions = target_positions[prefix_mask].to(
+                    device=req.prefix_indices.device,
+                    dtype=torch.long,
+                )
+                req.prefix_indices[prefix_positions] = new_locs[prefix_mask].to(
+                    device=req.prefix_indices.device,
+                    dtype=req.prefix_indices.dtype,
+                )
             total_realized += seg_len
 
         logger.info(

@@ -325,6 +325,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    segmented_sparse_positions: Optional[torch.Tensor] = None
+    segmented_sparse_prefill_metadata: Optional[List[object]] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -491,6 +493,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            segmented_sparse_positions=batch.segmented_sparse_positions,
+            segmented_sparse_prefill_metadata=batch.segmented_sparse_prefill_metadata,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
@@ -595,6 +599,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+            if ret.segmented_sparse_positions is not None:
+                ret.positions = ret.segmented_sparse_positions.to(
+                    device=device, non_blocking=True
+                )
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, model_runner, device)

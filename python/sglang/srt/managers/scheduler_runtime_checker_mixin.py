@@ -339,7 +339,7 @@ class SchedulerRuntimeCheckerMixin:
         """
         # After decode: running_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
-        batches = [self.last_batch]
+        batches = [self.last_batch] if self.last_batch is not None else []
         if (
             self.running_batch not in (None, self.last_batch)
             and not self.running_batch.is_empty()
@@ -351,6 +351,14 @@ class SchedulerRuntimeCheckerMixin:
         for batch in batches:
             for req in batch.reqs:
                 assert req.kv_committed_freed == req.kv_overallocated_freed
+                released_sparse_uncached = int(
+                    getattr(req, "segmented_sparse_released_uncached_len", 0) or 0
+                )
+                if req.kv_committed_freed and released_sparse_uncached:
+                    full_uncached += released_sparse_uncached
+                    if self.is_hybrid_swa:
+                        swa_uncached += released_sparse_uncached
+                    continue
                 if req.kv_committed_freed or req.req_pool_idx is None:
                     continue
 
@@ -500,7 +508,10 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         # memory leak check
-        has_leak, messages = self._check_all_pools(self.get_pool_stats())
+        full_uncached, _ = self._get_total_uncached_sizes()
+        has_leak, messages = self._check_all_pools(
+            self.get_pool_stats(), uncached=full_uncached
+        )
         if has_leak:
             self._report_leak("pool", "\n".join(messages))
         self._check_req_pool()

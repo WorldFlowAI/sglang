@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional
 
 import torch
@@ -78,6 +79,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "block_size": config.fuzzy_block_size,
                 "embedding_model_name": config.embedding_model_name,
                 "model_arch": config.model_arch,
+                "embedder_type": os.environ.get("SEMBLEND_EMBEDDER", "minilm"),
             }
         )
         self._adapter = self._adapter_cls(config=self._adapter_config)

@@ -8,6 +8,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -42,12 +43,17 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+_SEGMENTED_PREFILL_BACKEND = os.environ.get(
+    "SGLANG_SEMANTIC_KV_SEGMENTED_BACKEND", "dense"
+).lower()
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
 
+VariableBlockSparseAttentionWrapper = None
+flashinfer_packbits = None
 if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
@@ -56,6 +62,21 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+
+    try:
+        from flashinfer.sparse import VariableBlockSparseAttentionWrapper
+    except Exception:
+        try:
+            from flashinfer import VariableBlockSparseAttentionWrapper
+        except Exception:
+            VariableBlockSparseAttentionWrapper = None
+    try:
+        from flashinfer.quantization import packbits as flashinfer_packbits
+    except Exception:
+        try:
+            from flashinfer import packbits as flashinfer_packbits
+        except Exception:
+            flashinfer_packbits = None
 
 
 class WrapperDispatch(Enum):
@@ -266,6 +287,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        self.segmented_vbs_wrappers = []
+        self.segmented_vbs_plan_cache = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -282,6 +305,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         backend=self.prefill_backend,
                     )
                 )
+                self.segmented_vbs_wrappers.append(None)
+                self.segmented_vbs_plan_cache.append(None)
             self.decode_wrappers.append(
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -300,6 +325,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self._segmented_vbs_warning_logged = False
+        self._segmented_vbs_logged_rids = set()
+        self._segmented_paged_logged_rids = set()
+        self._segmented_fused_pack_warning_logged = False
+        self.segmented_fused_paged_mask_mode = "none"
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
@@ -489,6 +519,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic and not is_in_piecewise_cuda_graph()
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.segmented_sparse_prefill_metadata is not None:
+                use_ragged = False
+                extend_no_prefix = False
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()
@@ -508,6 +541,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                segmented_sparse_metadata=forward_batch.segmented_sparse_prefill_metadata,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -790,6 +824,23 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        if (
+            _SEGMENTED_PREFILL_BACKEND == "vbs"
+            and forward_batch.segmented_sparse_prefill_metadata is not None
+            and not self.forward_metadata.use_ragged
+        ):
+            o = self._try_forward_segmented_vbs(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                cache_loc=cache_loc,
+                save_kv_cache=save_kv_cache,
+            )
+            if o is not None:
+                return o
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -802,6 +853,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            if forward_batch.segmented_sparse_prefill_metadata is not None:
+                causal = False
+                if _SEGMENTED_PREFILL_BACKEND in (
+                    "sparse",
+                    "paged_vbs",
+                    "fused_paged_vbs",
+                ):
+                    self._log_segmented_paged_prefill_active(layer, forward_batch)
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -881,6 +940,325 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _try_forward_segmented_vbs(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        save_kv_cache: bool,
+    ) -> Optional[torch.Tensor]:
+        """Run segmented semantic prefill through FlashInfer VBS when supported.
+
+        This path is intentionally narrower than the paged sparse-query fallback.
+        It proves the SGLang planner/executor can drive FlashInfer's
+        VariableBlockSparseAttentionWrapper for arbitrary fresh/donor holes. If
+        any assumption is not met, the caller falls back to the existing paged
+        sparse-query path.
+        """
+        if VariableBlockSparseAttentionWrapper is None:
+            self._log_segmented_vbs_fallback("FlashInfer VBS wrapper is unavailable")
+            return None
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            self._log_segmented_vbs_fallback("cross/encoder attention is unsupported")
+            return None
+        sliding_window_size = layer.sliding_window_size
+        metadata = forward_batch.segmented_sparse_prefill_metadata
+        if len(metadata) != 1 or len(forward_batch.req_pool_indices) != 1:
+            self._log_segmented_vbs_fallback("batched segmented VBS is unsupported")
+            return None
+        v_head_dim = getattr(layer, "v_head_dim", layer.head_dim)
+        if v_head_dim != layer.head_dim:
+            self._log_segmented_vbs_fallback("V head dim differs from Q/K head dim")
+            return None
+        logits_soft_cap = getattr(layer, "logit_cap", None)
+        if logits_soft_cap:
+            self._log_segmented_vbs_fallback("logit soft-cap is unsupported")
+            return None
+        default_scale = 1.0 / math.sqrt(layer.head_dim)
+        if abs(float(layer.scaling) - default_scale) > 1e-6:
+            self._log_segmented_vbs_fallback(
+                "non-default attention scale is unsupported"
+            )
+            return None
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        item = metadata[0]
+        if item.fresh_token_count != q.shape[0]:
+            self._log_segmented_vbs_fallback("fresh query count does not match q")
+            return None
+
+        try:
+            wrapper = self._get_segmented_vbs_wrapper(layer)
+            device = q.device
+            prompt_len = int(item.prompt_token_count)
+            fresh_positions = torch.as_tensor(
+                item.fresh_positions, dtype=torch.int32, device=device
+            )
+            col_starts, col_ends, col_sizes, col_size_key = (
+                self._build_segmented_vbs_columns(
+                    item,
+                    device=device,
+                    use_hybrid_columns=(
+                        sliding_window_size is None or sliding_window_size == -1
+                    ),
+                )
+            )
+            causal_mask = fresh_positions[:, None] >= (col_ends[None, :] - 1)
+            if sliding_window_size is not None and sliding_window_size != -1:
+                causal_mask = causal_mask & (
+                    col_starts[None, :]
+                    >= fresh_positions[:, None] - sliding_window_size
+                )
+            block_mask_map = causal_mask.unsqueeze(0)
+            block_mask_map = block_mask_map.repeat(layer.tp_k_head_num, 1, 1)
+            row_sz = torch.ones(
+                (layer.tp_k_head_num, item.fresh_token_count),
+                dtype=torch.int32,
+                device=device,
+            )
+            col_sz = col_sizes.unsqueeze(0).repeat(layer.tp_k_head_num, 1)
+
+            req_idx = forward_batch.req_pool_indices[0]
+            logical_kv_indices = forward_batch.req_to_token_pool.req_to_token[
+                req_idx, :prompt_len
+            ].to(torch.long)
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            k_dense = k_cache.index_select(0, logical_kv_indices).permute(1, 0, 2)
+            v_dense = v_cache.index_select(0, logical_kv_indices).permute(1, 0, 2)
+            q_dense = q.view(-1, layer.tp_q_head_num, layer.head_dim).permute(1, 0, 2)
+
+            self._plan_segmented_vbs(
+                wrapper,
+                wrapper_idx=self._get_wrapper_idx(layer),
+                plan_key=(
+                    device.index,
+                    prompt_len,
+                    tuple(item.fresh_positions),
+                    tuple(item.donor_positions),
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                    layer.head_dim,
+                    sliding_window_size,
+                    col_size_key,
+                ),
+                block_mask_map=block_mask_map,
+                row_sz=row_sz,
+                col_sz=col_sz,
+                layer=layer,
+            )
+            out = wrapper.run(
+                q_dense.contiguous(),
+                k_dense.contiguous(),
+                v_dense.contiguous(),
+            )
+        except Exception as exc:
+            self._log_segmented_vbs_fallback(f"{type(exc).__name__}: {exc}")
+            return None
+
+        rid = None
+        if forward_batch.rids:
+            rid = forward_batch.rids[0]
+        log_key = rid or f"anon:{id(item)}"
+        if layer.layer_id == 0 and log_key not in self._segmented_vbs_logged_rids:
+            logger.info(
+                "[FUZZY RADIX] segmented VBS prefill active: "
+                "rid=%s fresh_tokens=%d donor_tokens=%d prompt_tokens=%d "
+                "column_blocks=%d",
+                rid,
+                item.fresh_token_count,
+                item.donor_token_count,
+                item.prompt_token_count,
+                col_sizes.numel(),
+            )
+            self._segmented_vbs_logged_rids.add(log_key)
+
+        return (
+            out.permute(1, 0, 2)
+            .contiguous()
+            .view(-1, layer.tp_q_head_num * layer.head_dim)
+        )
+
+    def _log_segmented_paged_prefill_active(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> None:
+        if layer.layer_id != 0:
+            return
+        metadata = forward_batch.segmented_sparse_prefill_metadata
+        if metadata is None or len(metadata) != 1:
+            return
+        item = metadata[0]
+        rid = forward_batch.rids[0] if forward_batch.rids else None
+        log_key = rid or f"anon:{id(item)}"
+        if log_key in self._segmented_paged_logged_rids:
+            return
+        is_fused = _SEGMENTED_PREFILL_BACKEND == "fused_paged_vbs"
+        event_name = (
+            "segmented fused paged VBS prefill active"
+            if is_fused
+            else "segmented paged prefill active"
+        )
+        mask_mode = self.segmented_fused_paged_mask_mode if is_fused else "custom_mask"
+        logger.info(
+            "[FUZZY RADIX] %s: "
+            "backend=%s rid=%s fresh_tokens=%d donor_tokens=%d prompt_tokens=%d "
+            "direct_paged_kv=True packed_custom_mask=%s custom_mask=%s "
+            "dense_kv_gather=False donor_materialization=False phases=1 "
+            "mask_mode=%s",
+            event_name,
+            _SEGMENTED_PREFILL_BACKEND,
+            rid,
+            item.fresh_token_count,
+            item.donor_token_count,
+            item.prompt_token_count,
+            mask_mode == "packed_custom_mask",
+            mask_mode != "packed_custom_mask",
+            mask_mode,
+        )
+        self._segmented_paged_logged_rids.add(log_key)
+
+    def _try_pack_segmented_custom_mask(
+        self, custom_mask: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if flashinfer_packbits is None:
+            if not self._segmented_fused_pack_warning_logged:
+                logger.warning(
+                    "[FUZZY RADIX] fused paged VBS falling back to custom_mask; "
+                    "flashinfer.packbits is unavailable"
+                )
+                self._segmented_fused_pack_warning_logged = True
+            return None
+        try:
+            return flashinfer_packbits(custom_mask.contiguous(), bitorder="little")
+        except TypeError:
+            return flashinfer_packbits(custom_mask.contiguous())
+        except Exception as exc:
+            if not self._segmented_fused_pack_warning_logged:
+                logger.warning(
+                    "[FUZZY RADIX] fused paged VBS falling back to custom_mask; "
+                    "packbits failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                self._segmented_fused_pack_warning_logged = True
+            return None
+
+    def _get_segmented_vbs_wrapper(self, layer: RadixAttention):
+        wrapper_idx = self._get_wrapper_idx(layer)
+        if wrapper_idx >= len(self.segmented_vbs_wrappers):
+            raise RuntimeError(
+                "segmented VBS wrapper requested without prefill support"
+            )
+        wrapper = self.segmented_vbs_wrappers[wrapper_idx]
+        if wrapper is None:
+            wrapper = VariableBlockSparseAttentionWrapper(self.workspace_buffer)
+            self.segmented_vbs_wrappers[wrapper_idx] = wrapper
+        return wrapper
+
+    def _plan_segmented_vbs(
+        self,
+        wrapper,
+        *,
+        wrapper_idx: int,
+        plan_key,
+        block_mask_map: torch.Tensor,
+        row_sz: torch.Tensor,
+        col_sz: torch.Tensor,
+        layer: RadixAttention,
+    ) -> None:
+        if wrapper_idx >= len(self.segmented_vbs_plan_cache):
+            raise RuntimeError(
+                "segmented VBS plan cache requested without prefill support"
+            )
+        if self.segmented_vbs_plan_cache[wrapper_idx] == plan_key:
+            return
+        wrapper.plan(
+            block_mask_map,
+            row_sz,
+            col_sz,
+            layer.tp_q_head_num,
+            layer.tp_k_head_num,
+            layer.head_dim,
+            causal=False,
+        )
+        self.segmented_vbs_plan_cache[wrapper_idx] = plan_key
+
+    def _build_segmented_vbs_columns(
+        self,
+        item,
+        *,
+        device: torch.device,
+        use_hybrid_columns: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        """Build VBS column blocks for a logical prompt.
+
+        Rows remain one fresh query token each for exact causal semantics.
+        For full-attention models, donor spans can be collapsed into large
+        variable columns while fresh columns stay token-level. This keeps the
+        mask exact for arbitrary holes and avoids treating donor KV as a
+        prefix hit.
+        """
+        prompt_len = int(item.prompt_token_count)
+        if not use_hybrid_columns:
+            starts = list(range(prompt_len))
+            ends = list(range(1, prompt_len + 1))
+            sizes = [1] * prompt_len
+            return (
+                torch.tensor(starts, dtype=torch.int32, device=device),
+                torch.tensor(ends, dtype=torch.int32, device=device),
+                torch.tensor(sizes, dtype=torch.int32, device=device),
+                tuple(sizes),
+            )
+
+        donor_positions = tuple(sorted(int(pos) for pos in item.donor_positions))
+        starts: list[int] = []
+        ends: list[int] = []
+        sizes: list[int] = []
+        donor_i = 0
+        pos = 0
+        while pos < prompt_len:
+            if donor_i < len(donor_positions) and donor_positions[donor_i] == pos:
+                start = pos
+                while (
+                    donor_i < len(donor_positions) and donor_positions[donor_i] == pos
+                ):
+                    donor_i += 1
+                    pos += 1
+                starts.append(start)
+                ends.append(pos)
+                sizes.append(pos - start)
+            else:
+                starts.append(pos)
+                ends.append(pos + 1)
+                sizes.append(1)
+                pos += 1
+
+        return (
+            torch.tensor(starts, dtype=torch.int32, device=device),
+            torch.tensor(ends, dtype=torch.int32, device=device),
+            torch.tensor(sizes, dtype=torch.int32, device=device),
+            tuple(sizes),
+        )
+
+    def _log_segmented_vbs_fallback(self, reason: str) -> None:
+        if not self._segmented_vbs_warning_logged:
+            logger.warning(
+                "[FUZZY RADIX] segmented VBS fallback to paged sparse prefill: %s",
+                reason,
+            )
+            self._segmented_vbs_warning_logged = True
 
     @debug_kernel_api
     def forward_decode(
@@ -1241,6 +1619,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        segmented_sparse_metadata: Optional[list] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1258,6 +1637,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        segmented_sparse_metadata: Optional[list] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1283,6 +1663,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            segmented_sparse_metadata=segmented_sparse_metadata,
         )
 
     def update_sliding_window(
@@ -1298,6 +1679,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        segmented_sparse_metadata: Optional[list] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1332,6 +1714,7 @@ class FlashInferIndicesUpdaterPrefill:
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 multi_item_params=multi_item_params,
+                segmented_sparse_metadata=segmented_sparse_metadata,
             )
 
     def update_cross_attention(
@@ -1347,6 +1730,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        segmented_sparse_metadata: Optional[list] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1374,6 +1758,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                segmented_sparse_metadata=segmented_sparse_metadata,
             )
 
     def call_begin_forward(
@@ -1393,9 +1778,56 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        segmented_sparse_metadata: Optional[list] = None,
     ):
         bs = len(seq_lens)
-        if spec_info is None:
+        packed_custom_mask = None
+        if spec_info is None and segmented_sparse_metadata is not None:
+            assert len(segmented_sparse_metadata) == bs
+            prompt_lens = torch.tensor(
+                [item.prompt_token_count for item in segmented_sparse_metadata],
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            kv_indptr[1 : bs + 1] = torch.cumsum(prompt_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+
+            kv_indices = torch.empty(
+                int(prompt_lens.sum().item()) + 256,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            kv_cursor = 0
+            mask_parts = []
+            fresh_counts = []
+            for req_idx, item in zip(req_pool_indices, segmented_sparse_metadata):
+                prompt_len = item.prompt_token_count
+                kv_slice = self.req_to_token[req_idx, :prompt_len].to(torch.int32)
+                kv_indices[kv_cursor : kv_cursor + prompt_len] = kv_slice
+                kv_cursor += prompt_len
+
+                fresh_positions = torch.tensor(
+                    item.fresh_positions,
+                    dtype=torch.int64,
+                    device=req_pool_indices.device,
+                )
+                columns = torch.arange(
+                    prompt_len, dtype=torch.int64, device=req_pool_indices.device
+                )
+                mask_parts.append(
+                    (fresh_positions[:, None] >= columns[None, :]).reshape(-1)
+                )
+                fresh_counts.append(item.fresh_token_count)
+
+            qo_lens = torch.tensor(
+                fresh_counts, dtype=torch.int32, device=req_pool_indices.device
+            )
+            qo_indptr[1 : bs + 1] = torch.cumsum(qo_lens, dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
+            custom_mask = torch.cat(mask_parts).to(torch.bool)
+            bs_eff = bs
+
+        elif spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1504,7 +1936,35 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
-        wrapper_paged.begin_forward(
+        if (
+            segmented_sparse_metadata is not None
+            and _SEGMENTED_PREFILL_BACKEND == "fused_paged_vbs"
+            and use_custom_mask is not None
+        ):
+            packed_custom_mask = self.attn_backend._try_pack_segmented_custom_mask(
+                use_custom_mask
+            )
+            self.attn_backend.segmented_fused_paged_mask_mode = (
+                "packed_custom_mask"
+                if packed_custom_mask is not None
+                else "custom_mask"
+            )
+        elif segmented_sparse_metadata is not None:
+            self.attn_backend.segmented_fused_paged_mask_mode = (
+                "custom_mask" if use_custom_mask is not None else "none"
+            )
+
+        paged_plan_kwargs = {
+            "q_data_type": self.q_data_type,
+            "kv_data_type": self.data_type,
+            "non_blocking": True,
+            "fixed_split_size": fixed_split_size,
+            "prefix_len_ptr": prefix_len_ptr,
+            "token_pos_in_items_ptr": token_pos_in_items_ptr,
+            "token_pos_in_items_len": token_pos_in_items_len,
+            "max_item_len_ptr": max_item_len_ptr,
+        }
+        paged_plan_args = (
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -1513,15 +1973,33 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
+        )
+        if packed_custom_mask is not None:
+            try:
+                wrapper_paged.begin_forward(
+                    *paged_plan_args,
+                    custom_mask=None,
+                    packed_custom_mask=packed_custom_mask,
+                    **paged_plan_kwargs,
+                )
+                return
+            except TypeError as exc:
+                if "packed_custom_mask" not in str(exc):
+                    raise
+                self.attn_backend.segmented_fused_paged_mask_mode = (
+                    "custom_mask_fallback"
+                )
+                if not self.attn_backend._segmented_fused_pack_warning_logged:
+                    logger.warning(
+                        "[FUZZY RADIX] fused paged VBS falling back to custom_mask; "
+                        "FlashInfer begin_forward rejected packed_custom_mask"
+                    )
+                    self.attn_backend._segmented_fused_pack_warning_logged = True
+
+        wrapper_paged.begin_forward(
+            *paged_plan_args,
             custom_mask=use_custom_mask,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
+            **paged_plan_kwargs,
         )
 
 

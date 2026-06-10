@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+_SEGMENTED_PREFILL_BACKEND = os.environ.get(
+    "SGLANG_SEMANTIC_KV_SEGMENTED_BACKEND", "dense"
+).lower()
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -24,10 +28,10 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
-import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
@@ -43,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -626,6 +631,16 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        forced_segmented_chunk = self._maybe_prepare_segmented_prefill_phase(req)
+        if getattr(req, "segmented_sparse_prefill_active", False):
+            self.can_run_list.append(req)
+            self._update_prefill_budget(
+                0,
+                req.extend_input_len,
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+            )
+            return None
+
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -646,13 +661,242 @@ class PrefillAdder:
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
+                if not truncated and not forced_segmented_chunk
                 else 0
             ),
         )
 
         # Return if chunked prefill not finished
-        return req if truncated else None
+        return req if truncated or forced_segmented_chunk else None
+
+    def _maybe_prepare_segmented_prefill_phase(self, req: Req) -> bool:
+        """Prepare one dense phase from a segmented semantic prefill plan.
+
+        Returns True when the request must remain chunked after this phase.
+        """
+        plan = getattr(req, "segmented_prefill_plan", None)
+        if plan is None:
+            return False
+
+        if (
+            _SEGMENTED_PREFILL_BACKEND
+            in ("sparse", "vbs", "paged_vbs", "fused_paged_vbs")
+            and getattr(req, "requires_segmented_prefill_backend", False)
+            and plan.fresh_token_count > 0
+        ):
+            req.segmented_sparse_prefill_active = True
+            req.set_extend_input_len(plan.fresh_token_count)
+            logger.info(
+                "[FUZZY RADIX] segmented sparse prefill armed: "
+                "backend=%s rid=%s fresh_tokens=%d donor_tokens=%d prompt_tokens=%d",
+                _SEGMENTED_PREFILL_BACKEND,
+                getattr(req, "rid", None),
+                plan.fresh_token_count,
+                plan.donor_token_count,
+                plan.prompt_token_count,
+            )
+            return False
+
+        if (
+            _SEGMENTED_PREFILL_BACKEND == "phased_paged"
+            and getattr(req, "requires_segmented_prefill_backend", False)
+            and not getattr(req, "segmented_phased_paged_logged", False)
+        ):
+            req.segmented_phased_paged_logged = True
+            logger.info(
+                "[FUZZY RADIX] segmented phased paged prefill active: "
+                "backend=%s rid=%s fresh_tokens=%d donor_tokens=%d "
+                "prompt_tokens=%d phases=%d direct_paged_kv=True "
+                "custom_mask=False dense_kv_gather=False",
+                _SEGMENTED_PREFILL_BACKEND,
+                getattr(req, "rid", None),
+                plan.fresh_token_count,
+                plan.donor_token_count,
+                plan.prompt_token_count,
+                len(plan.phased_dense_steps),
+            )
+
+        consumed_donor = False
+        while True:
+            prefix_len = len(req.prefix_indices)
+            try:
+                step = plan.next_backend_step(prefix_len)
+            except ValueError as exc:
+                logger.warning(
+                    "[FUZZY RADIX] invalid segmented prefill state for "
+                    "rid=%s prefix_len=%d: %s; falling back to fresh prefill",
+                    getattr(req, "rid", None),
+                    prefix_len,
+                    exc,
+                )
+                self._disable_segmented_prefill(req)
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                return False
+
+            if step is None:
+                req.requires_segmented_prefill_backend = False
+                req.set_extend_input_len(len(req.fill_ids) - prefix_len)
+                return False
+
+            if step.kind == "realize_donor":
+                if not self._append_segmented_donor_step(req, step):
+                    self._disable_segmented_prefill(req)
+                    req.set_extend_input_len(
+                        len(req.fill_ids) - len(req.prefix_indices)
+                    )
+                    return False
+                consumed_donor = True
+                continue
+
+            if step.end_pos <= prefix_len:
+                return consumed_donor
+            req.set_extend_input_len(step.end_pos - prefix_len)
+            req.fill_ids = req.fill_ids[: step.end_pos]
+            if _SEGMENTED_PREFILL_BACKEND == "phased_paged":
+                logger.info(
+                    "[FUZZY RADIX] segmented phased paged compute fresh: "
+                    "rid=%s fresh_tokens=%d target=[%d,%d) prefix_len=%d "
+                    "future_donor=%s",
+                    getattr(req, "rid", None),
+                    step.end_pos - prefix_len,
+                    prefix_len,
+                    step.end_pos,
+                    prefix_len,
+                    plan.has_donor_after(step.end_pos),
+                )
+            return plan.has_donor_after(step.end_pos)
+
+    def _append_segmented_donor_step(self, req: Req, step) -> bool:
+        plan = getattr(req, "segmented_prefill_plan", None)
+        fuzzy_result = getattr(req, "segmented_prefill_fuzzy_result", None)
+        if plan is None or fuzzy_result is None:
+            return False
+
+        prefix_len = len(req.prefix_indices)
+        if step.start_pos != prefix_len:
+            logger.warning(
+                "[FUZZY RADIX] segmented donor phase is not contiguous: "
+                "rid=%s prefix_len=%d donor_start=%d donor_end=%d",
+                getattr(req, "rid", None),
+                prefix_len,
+                step.start_pos,
+                step.end_pos,
+            )
+            return False
+
+        segments = self._select_fuzzy_segments_for_range(
+            getattr(fuzzy_result, "segments", None),
+            prefix_len,
+            step.end_pos,
+        )
+        if not segments:
+            return False
+
+        kv_parts = []
+        for seg in segments:
+            if seg.donor_kv_indices is None:
+                return False
+            kv_parts.append(seg.donor_kv_indices.to(dtype=req.prefix_indices.dtype))
+        donor_kv_indices = torch.cat(kv_parts) if kv_parts else None
+        if donor_kv_indices is None or donor_kv_indices.numel() == 0:
+            return False
+
+        num_donor = int(donor_kv_indices.numel())
+        if num_donor != step.length:
+            logger.warning(
+                "[FUZZY RADIX] segmented donor phase length mismatch: "
+                "rid=%s planned=%d actual=%d",
+                getattr(req, "rid", None),
+                step.length,
+                num_donor,
+            )
+            return False
+
+        evict_from_tree_cache(self.tree_cache, num_donor)
+        realized_locs = self.tree_cache.token_to_kv_pool_allocator.alloc(num_donor)
+        if realized_locs is None:
+            logger.info(
+                "[FUZZY RADIX] no pool capacity for segmented donor phase; "
+                "falling back to fresh prefill"
+            )
+            return False
+
+        prev_locs = getattr(req, "fuzzy_realized_locs", None)
+        if prev_locs is not None:
+            try:
+                self.tree_cache.token_to_kv_pool_allocator.free(prev_locs)
+            except Exception:
+                pass
+
+        req.fuzzy_realized_locs = realized_locs
+        req.cache_fuzzy_matched_len = num_donor
+        req.fuzzy_match_result = replace(
+            fuzzy_result,
+            cached_token_count=num_donor,
+            cached_token_ids=[0] * num_donor,
+            kv_cache_indices=donor_kv_indices,
+            segments=segments,
+        )
+        req.semantic_kv_request_local = True
+        if getattr(req, "semantic_kv_tree_prefix_len", 0) == 0:
+            req.semantic_kv_tree_prefix_len = req.cache_protected_len
+        req.prefix_indices = torch.cat(
+            [
+                req.prefix_indices,
+                donor_kv_indices.to(
+                    device=req.prefix_indices.device,
+                    dtype=req.prefix_indices.dtype,
+                ),
+            ]
+        )
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        logger.info(
+            "[FUZZY RADIX] segmented prefill realized donor phase: "
+            "backend=%s rid=%s donor_tokens=%d target=[%d,%d) "
+            "prefix_len=%d direct_paged_kv=True",
+            _SEGMENTED_PREFILL_BACKEND,
+            getattr(req, "rid", None),
+            num_donor,
+            step.start_pos,
+            step.end_pos,
+            len(req.prefix_indices),
+        )
+        return True
+
+    def _disable_segmented_prefill(self, req: Req) -> None:
+        req.segmented_prefill_plan = None
+        req.segmented_prefill_fuzzy_result = None
+        req.requires_segmented_prefill_backend = False
+        req.segmented_sparse_prefill_active = False
+        req.segmented_phased_paged_logged = False
+        req.fuzzy_match_result = None
+        req.cache_fuzzy_matched_len = 0
+        leftover = getattr(req, "fuzzy_realized_locs", None)
+        if leftover is not None:
+            try:
+                self.tree_cache.token_to_kv_pool_allocator.free(leftover)
+            except Exception:
+                pass
+            req.fuzzy_realized_locs = None
+
+    def _select_fuzzy_segments_for_range(self, segments, start: int, end: int):
+        if not segments:
+            return []
+        selected = []
+        cursor = start
+        for seg in sorted(segments, key=lambda s: int(s.target_positions[0])):
+            target_positions = seg.target_positions
+            seg_start = int(target_positions[0])
+            seg_end = int(target_positions[-1]) + 1
+            if seg_end <= cursor:
+                continue
+            if seg_start != cursor or seg_end > end:
+                break
+            selected.append(seg)
+            cursor = seg_end
+            if cursor == end:
+                break
+        return selected if cursor == end else []
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -792,6 +1036,47 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        forced_segmented_chunk = self._maybe_prepare_segmented_prefill_phase(req)
+        if getattr(req, "segmented_sparse_prefill_active", False):
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            total_tokens = input_tokens + max_new + self.page_size
+
+            if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
+            if self.is_hybrid_swa:
+                swa_needed = self._swa_budget_for_req(req.extend_input_len)
+                if swa_needed >= self.rem_swa_tokens:
+                    return AddReqResult.NO_TOKEN
+
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            with self._lock_node(req.last_node):
+                if total_tokens >= self.rem_total_tokens:
+                    return AddReqResult.NO_TOKEN
+
+                if self.is_hybrid_swa:
+                    swa_needed = self._swa_budget_for_req(req.extend_input_len)
+                    if swa_needed >= self.rem_swa_tokens:
+                        return AddReqResult.NO_TOKEN
+
+                if (
+                    input_tokens >= self.rem_input_tokens
+                    and len(self.can_run_list) != 0
+                ):
+                    return AddReqResult.OTHER
+
+                self.can_run_list.append(req)
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(
+                    0,
+                    input_tokens,
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                )
+
+            return self.budget_state()
+
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -842,23 +1127,29 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
+                if forced_segmented_chunk:
+                    self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
+                    (
+                        0
+                        if forced_segmented_chunk
+                        else min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
                     ),
                 )
             else:

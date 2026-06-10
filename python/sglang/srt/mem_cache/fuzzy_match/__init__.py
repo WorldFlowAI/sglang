@@ -23,12 +23,22 @@ from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
     as_long_tensor,
     copy_kv_with_rope_correction,
 )
+from sglang.srt.mem_cache.fuzzy_match.segmented_prefill import (
+    SegmentedPrefillBackendStep,
+    SegmentedPrefillPlan,
+    SegmentedPrefillSpan,
+    build_segmented_prefill_plan,
+)
 
 __all__ = [
     "FuzzyMatchConfig",
     "FuzzyMatchProvider",
     "FuzzyMatchResult",
+    "SegmentedPrefillBackendStep",
+    "SegmentedPrefillPlan",
+    "SegmentedPrefillSpan",
     "as_long_tensor",
+    "build_segmented_prefill_plan",
     "copy_kv_with_rope_correction",
     "create_fuzzy_match_provider",
 ]

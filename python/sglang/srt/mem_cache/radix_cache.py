@@ -27,6 +27,7 @@ import logging
 import sys
 import time
 from collections import defaultdict
+from dataclasses import replace
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -69,6 +70,9 @@ from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
     FuzzyMatchProvider,
     FuzzyMatchResult,
+)
+from sglang.srt.mem_cache.fuzzy_match.segmented_prefill import (
+    build_segmented_prefill_plan,
 )
 
 if TYPE_CHECKING:
@@ -485,9 +489,33 @@ class RadixCache(BasePrefixCache):
         exact_matched_len = len(value)
         total_len = len(key.token_ids) if hasattr(key, 'token_ids') else len(key)
         
-        # Step 2: If exact match is incomplete, try fuzzy matching
+        # Step 2: If exact match is incomplete, try fuzzy matching.
+        #
+        # Requests that explicitly register a donor range should not themselves
+        # consume fuzzy KV. Otherwise a benchmark or production registration
+        # request can become a recipient of an earlier approximate donor and
+        # then fail to create an independent clean donor for later targets.
+        # Exact prefix reuse is still allowed above.
         fuzzy_matched_len = 0
-        if exact_matched_len < total_len:
+        skip_fuzzy_for_donor_registration = False
+        if params.req is not None:
+            cache_start = getattr(params.req, "cache_start_pos", None)
+            cache_end = getattr(params.req, "cache_end_pos", None)
+            skip_fuzzy_for_donor_registration = (
+                cache_start is not None
+                and cache_end is not None
+                and cache_end != -1
+                and int(cache_end) > int(cache_start)
+            )
+
+        if exact_matched_len < total_len and not skip_fuzzy_for_donor_registration:
+            if params.req is not None:
+                params.req.fuzzy_match_result = None
+                params.req.segmented_prefill_plan = None
+                params.req.segmented_prefill_fuzzy_result = None
+                params.req.requires_segmented_prefill_backend = False
+                params.req.segmented_sparse_prefill_active = False
+
             logger.info(
                 f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, fuzzy=0, "
                 f"miss={total_len - exact_matched_len}, total={total_len}, attempting fuzzy..."
@@ -504,18 +532,17 @@ class RadixCache(BasePrefixCache):
             
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
-                donor_last_node_id = getattr(
-                    fuzzy_result, "donor_last_node_id", None
-                )
-                if (
-                    donor_last_node_id is not None
-                    and donor_last_node_id not in self._node_registry
-                ):
+                stale_donor_node_ids = [
+                    node_id
+                    for node_id in self._fuzzy_result_donor_node_ids(fuzzy_result)
+                    if node_id not in self._node_registry
+                ]
+                if stale_donor_node_ids:
                     rid = getattr(params.req, "rid", None) if params.req is not None else None
                     logger.warning(
                         f"[FUZZY RADIX] dropping fuzzy match for stale "
                         f"rid={rid} "
-                        f"donor_last_node_id={donor_last_node_id}; "
+                        f"donor_node_ids={stale_donor_node_ids}; "
                         f"the radix cache was likely reset after the donor "
                         f"was registered"
                     )
@@ -525,12 +552,89 @@ class RadixCache(BasePrefixCache):
                         last_host_node=last_node,
                     )
 
+                segmented_plan = None
+                segments = getattr(fuzzy_result, "segments", None)
+                if segments:
+                    rid = (
+                        getattr(params.req, "rid", None)
+                        if params.req is not None
+                        else None
+                    )
+                    try:
+                        # match_prefix receives the prefix-cache key, which is
+                        # intentionally capped at input_len - 1 for logprob
+                        # behavior. Segmented prefill still has to consume the
+                        # full request prompt, otherwise the backend skips the
+                        # final prompt token before decode.
+                        segmented_prompt_token_count = (
+                            len(params.req.fill_ids)
+                            if params.req is not None
+                            else total_len
+                        )
+                        segmented_plan = build_segmented_prefill_plan(
+                            prompt_token_count=segmented_prompt_token_count,
+                            exact_prefix_len=exact_matched_len,
+                            segments=segments,
+                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            f"[FUZZY RADIX] dropping invalid segmented fuzzy "
+                            f"match for rid={rid}: {exc}"
+                        )
+                        return MatchResult(
+                            device_indices=value,
+                            last_device_node=last_node,
+                            last_host_node=last_node,
+                        )
+
+                    if params.req is not None:
+                        params.req.segmented_prefill_plan = segmented_plan
+                        params.req.segmented_prefill_fuzzy_result = fuzzy_result
+                        params.req.requires_segmented_prefill_backend = (
+                            not segmented_plan.prefix_contract_compatible
+                        )
+
+                    if not segmented_plan.prefix_contract_compatible:
+                        leading_segments = self._leading_fuzzy_segments(
+                            segments,
+                            exact_matched_len,
+                        )
+                        if not leading_segments:
+                            self._protect_fuzzy_donor_node(
+                                params.req,
+                                fuzzy_result,
+                            )
+                            logger.info(
+                                f"[FUZZY RADIX] segmented fuzzy match requires "
+                                f"fresh-prefill phase before donor reuse: rid={rid}, "
+                                f"donor_tokens={segmented_plan.donor_token_count}, "
+                                f"fresh_holes={len(segmented_plan.fresh_target_positions)}, "
+                                f"skipped_by_prefix_compression="
+                                f"{segmented_plan.skipped_by_prefix_compression[:16]}"
+                            )
+                            return MatchResult(
+                                device_indices=value,
+                                last_device_node=last_node,
+                                last_host_node=last_node,
+                            )
+                        fuzzy_result = self._slice_fuzzy_result(
+                            fuzzy_result,
+                            leading_segments,
+                        )
+                        fuzzy_matched_len = fuzzy_result.cached_token_count
+                        if params.req is not None:
+                            params.req.fuzzy_match_result = fuzzy_result
+                        logger.info(
+                            f"[FUZZY RADIX] segmented fuzzy match consuming "
+                            f"leading donor phase: rid={rid}, "
+                            f"leading_donor_tokens={fuzzy_matched_len}, "
+                            f"remaining_fresh_holes="
+                            f"{len(segmented_plan.fresh_target_positions)}"
+                        )
+
                 # Allocate before mutating request state so capacity failure
                 # can fall back to exact-only cleanly.
-                needs_realization = fuzzy_matched_len > 0 and (
-                    getattr(fuzzy_result, "segments", None) is not None
-                    or fuzzy_result.cached_start_pos != exact_matched_len
-                )
+                needs_realization = fuzzy_matched_len > 0
                 realized_locs = None
                 if params.req is not None and needs_realization:
                     realized_locs = self.token_to_kv_pool_allocator.alloc(
@@ -594,30 +698,12 @@ class RadixCache(BasePrefixCache):
 
                 if params.req is not None:
                     params.req.fuzzy_match_result = fuzzy_result
+                    if fuzzy_matched_len > 0:
+                        params.req.semantic_kv_request_local = True
+                        params.req.semantic_kv_tree_prefix_len = exact_matched_len
 
                 # Protect donor slots until the recipient request finishes.
-                if (
-                    params.req is not None
-                    and getattr(fuzzy_result, "donor_last_node_id", None) is not None
-                ):
-                    donor_node = self._node_registry.get(
-                        fuzzy_result.donor_last_node_id
-                    )
-                    if donor_node is not None:
-                        # Release any prior donor lock before acquiring
-                        # a new one (chunked-prefill / resume case).
-                        prev_donor = getattr(params.req, "fuzzy_donor_node", None)
-                        if prev_donor is not None and prev_donor is not donor_node:
-                            self.dec_lock_ref(prev_donor)
-                        self.inc_lock_ref(donor_node)
-                        params.req.fuzzy_donor_node = donor_node
-                    else:
-                        logger.warning(
-                            f"[FUZZY RADIX] donor_last_node_id="
-                            f"{fuzzy_result.donor_last_node_id} not in "
-                            f"_node_registry; donor KV may be evicted "
-                            f"mid-request"
-                        )
+                self._protect_fuzzy_donor_node(params.req, fuzzy_result)
 
                 merged_value = torch.cat([value, fuzzy_kv_indices])
                 return MatchResult(
@@ -625,13 +711,24 @@ class RadixCache(BasePrefixCache):
                     last_device_node=last_node,
                     last_host_node=last_node,
                     fuzzy_matched_len=fuzzy_result.cached_token_count,
-                    cache_protected_len=exact_matched_len + fuzzy_result.cached_token_count,
+                    cache_protected_len=(
+                        exact_matched_len
+                        if getattr(params.req, "semantic_kv_request_local", False)
+                        else exact_matched_len + fuzzy_result.cached_token_count
+                    ),
                 )
             else:
                 logger.info(
                     f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, fuzzy=0, "
                     f"miss={total_len - exact_matched_len}, total={total_len}, fuzzy match failed"
                 )
+        elif exact_matched_len < total_len and skip_fuzzy_for_donor_registration:
+            rid = getattr(params.req, "rid", None) if params.req is not None else None
+            logger.info(
+                f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, fuzzy=0, "
+                f"miss={total_len - exact_matched_len}, total={total_len}, "
+                f"skip fuzzy for donor registration rid={rid}"
+            )
         else:
             logger.info(
                 f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, fuzzy=0, "
@@ -644,6 +741,71 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
             fuzzy_matched_len=0,
         )
+
+    def _leading_fuzzy_segments(
+        self,
+        segments,
+        exact_matched_len: int,
+    ):
+        """Return provider segments contiguous from the current prefix."""
+        ordered = sorted(
+            segments,
+            key=lambda seg: int(seg.target_positions[0].item())
+            if hasattr(seg.target_positions[0], "item")
+            else int(seg.target_positions[0]),
+        )
+        cursor = exact_matched_len
+        selected = []
+        for seg in ordered:
+            target_positions = seg.target_positions
+            start = (
+                int(target_positions[0].item())
+                if hasattr(target_positions[0], "item")
+                else int(target_positions[0])
+            )
+            end = (
+                int(target_positions[-1].item())
+                if hasattr(target_positions[-1], "item")
+                else int(target_positions[-1])
+            ) + 1
+            if end <= cursor:
+                continue
+            if start != cursor:
+                break
+            selected.append(seg)
+            cursor = end
+        return selected
+
+    def _slice_fuzzy_result(
+        self,
+        fuzzy_result: FuzzyMatchResult,
+        segments,
+    ) -> FuzzyMatchResult:
+        """Build a fuzzy result for only the selected contiguous donor phase."""
+        kv_indices = [
+            seg.donor_kv_indices.to(dtype=torch.int64)
+            for seg in segments
+            if seg.donor_kv_indices is not None
+        ]
+        if len(kv_indices) != len(segments):
+            return replace(
+                fuzzy_result,
+                cached_token_count=0,
+                cached_token_ids=[],
+                kv_cache_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+                segments=[],
+            )
+        merged = torch.cat(kv_indices) if kv_indices else torch.empty((0,), dtype=torch.int64)
+        target_ids = []
+        for seg in segments:
+            target_ids.extend([0] * len(seg.target_positions))
+        return replace(
+            fuzzy_result,
+            cached_token_count=int(merged.numel()),
+            cached_token_ids=target_ids,
+            kv_cache_indices=merged,
+            segments=list(segments),
+        )
     
     def match_prefix_fuzzy(
         self,
@@ -654,15 +816,15 @@ class RadixCache(BasePrefixCache):
         
         Called from match_prefix when exact_matched_len < total_len.
         """
-        # Check minimum match length: need enough exact match to anchor fuzzy search
         if self.fuzzy_match_provider is None:
             return None
         if exact_matched_len > 0 and exact_matched_len < self.fuzzy_config.fuzzy_min_match_length:
             logger.info(
-                f"[FUZZY RADIX] Skipping fuzzy match: exact_matched_len({exact_matched_len}) "
-                f"< fuzzy_min_match_length({self.fuzzy_config.fuzzy_min_match_length})"
+                f"[FUZZY RADIX] exact prefix anchor is short "
+                f"({exact_matched_len} < {self.fuzzy_config.fuzzy_min_match_length}); "
+                f"continuing semantic match because min_match_length gates "
+                f"reusable donor span length, not prompt framing length"
             )
-            return None
         
         try:
             result = self.fuzzy_match_provider.match_on_prefix_miss(
@@ -705,6 +867,76 @@ class RadixCache(BasePrefixCache):
             import traceback
             logger.error(traceback.format_exc())
             return None
+
+    def _protect_fuzzy_donor_node(
+        self,
+        req: Optional["Req"],
+        fuzzy_result: FuzzyMatchResult,
+    ) -> None:
+        """Hold donor TreeNodes while a semantic request is in flight."""
+        if req is None:
+            return
+        donor_node_ids = self._fuzzy_result_donor_node_ids(fuzzy_result)
+        if not donor_node_ids:
+            return
+
+        protected = list(getattr(req, "fuzzy_donor_nodes", None) or [])
+        legacy = getattr(req, "fuzzy_donor_node", None)
+        if legacy is not None and not any(node is legacy for node in protected):
+            protected.append(legacy)
+
+        for donor_node_id in donor_node_ids:
+            donor_node = self._node_registry.get(donor_node_id)
+            if donor_node is None:
+                logger.warning(
+                    f"[FUZZY RADIX] donor_node_id={donor_node_id} "
+                    f"not in _node_registry; donor KV may be evicted mid-request"
+                )
+                continue
+            if any(node is donor_node for node in protected):
+                continue
+            self.inc_lock_ref(donor_node)
+            protected.append(donor_node)
+
+        req.fuzzy_donor_nodes = protected
+        req.fuzzy_donor_node = protected[0] if protected else None
+
+    def _fuzzy_result_donor_node_ids(
+        self,
+        fuzzy_result: FuzzyMatchResult,
+    ) -> List[int]:
+        """Collect all donor TreeNode ids referenced by a fuzzy result."""
+        donor_node_ids: List[int] = []
+
+        def add(node_id):
+            if node_id is None:
+                return
+            node_id = int(node_id)
+            if node_id not in donor_node_ids:
+                donor_node_ids.append(node_id)
+
+        add(getattr(fuzzy_result, "donor_last_node_id", None))
+        for segment in getattr(fuzzy_result, "segments", None) or []:
+            add(getattr(segment, "donor_node_id", None))
+        return donor_node_ids
+
+    def _release_fuzzy_donor_nodes(self, req: "Req") -> None:
+        """Release every donor TreeNode lock held by a request."""
+        nodes = list(getattr(req, "fuzzy_donor_nodes", None) or [])
+        legacy = getattr(req, "fuzzy_donor_node", None)
+        if legacy is not None and not any(node is legacy for node in nodes):
+            nodes.append(legacy)
+
+        released = set()
+        for node in nodes:
+            marker = id(node)
+            if marker in released:
+                continue
+            released.add(marker)
+            self.dec_lock_ref(node)
+
+        req.fuzzy_donor_nodes = []
+        req.fuzzy_donor_node = None
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -763,6 +995,8 @@ class RadixCache(BasePrefixCache):
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
+        if getattr(req, "semantic_kv_request_local", False):
+            is_insert = False
 
         # Reclaim realization slots if the forward pass never consumed them.
         leftover = getattr(req, "fuzzy_realized_locs", None)
@@ -779,10 +1013,7 @@ class RadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            donor_node = getattr(req, "fuzzy_donor_node", None)
-            if donor_node is not None:
-                self.dec_lock_ref(donor_node)
-                req.fuzzy_donor_node = None
+            self._release_fuzzy_donor_nodes(req)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -854,10 +1085,7 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
 
         # Release the donor lock_ref acquired in match_prefix.
-        donor_node = getattr(req, "fuzzy_donor_node", None)
-        if donor_node is not None:
-            self.dec_lock_ref(donor_node)
-            req.fuzzy_donor_node = None
+        self._release_fuzzy_donor_nodes(req)
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -865,6 +1093,25 @@ class RadixCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
+            return
+
+        if getattr(req, "semantic_kv_request_local", False):
+            token_ids = req.fill_ids
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            req.cache_protected_len = min(
+                getattr(req, "semantic_kv_tree_prefix_len", 0),
+                len(req.prefix_indices),
+            )
+
+            # Keep exactly one tree lock for the exact prefix node while the
+            # request is between chunks. This mirrors the dec/inc transfer in
+            # the normal insertion path without inserting approximate KV into
+            # exact-prefix cache state.
+            self.dec_lock_ref(req.last_node)
+            self.inc_lock_ref(req.last_node)
             return
 
         token_ids = req.fill_ids

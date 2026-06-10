@@ -11,7 +11,10 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
-from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import FuzzyMatchResult
+from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
+    FuzzyMatchResult,
+    FuzzyMatchSegment,
+)
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
@@ -118,6 +121,73 @@ class TestSemanticEmbeddingProvider(unittest.TestCase):
 
 
 class TestRadixFuzzyConcurrency(unittest.TestCase):
+    def test_multi_donor_segments_lock_all_donor_nodes(self):
+        try:
+            from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+            from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+        except TypeError as e:
+            self.skipTest(f"local torch custom-op registration unavailable: {e}")
+
+        cache = RadixCache.create_simulated()
+        donor_a_insert = cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+            )
+        )
+        donor_b_insert = cache.insert(
+            InsertParams(
+                key=RadixKey([5, 6, 7, 8]),
+                value=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+            )
+        )
+        donor_a = cache._node_registry[donor_a_insert.last_node_id]
+        donor_b = cache._node_registry[donor_b_insert.last_node_id]
+
+        class Req:
+            fuzzy_donor_node = None
+            fuzzy_donor_nodes = []
+
+        req = Req()
+        result = FuzzyMatchResult(
+            cached_token_count=4,
+            cached_token_ids=[0, 0, 0, 0],
+            prompt_token_count=4,
+            kv_cache_indices=torch.tensor([10, 11, 20, 21], dtype=torch.int64),
+            position_offset=0,
+            donor_last_node_id=donor_a_insert.last_node_id,
+            segments=[
+                FuzzyMatchSegment(
+                    target_positions=torch.tensor([0, 1], dtype=torch.int64),
+                    donor_positions=torch.tensor([0, 1], dtype=torch.int64),
+                    donor_node_id=donor_a_insert.last_node_id,
+                    donor_kv_indices=torch.tensor([10, 11], dtype=torch.int64),
+                    donor_req_id="donor-a",
+                ),
+                FuzzyMatchSegment(
+                    target_positions=torch.tensor([2, 3], dtype=torch.int64),
+                    donor_positions=torch.tensor([0, 1], dtype=torch.int64),
+                    donor_node_id=donor_b_insert.last_node_id,
+                    donor_kv_indices=torch.tensor([20, 21], dtype=torch.int64),
+                    donor_req_id="donor-b",
+                ),
+            ],
+        )
+
+        cache._protect_fuzzy_donor_node(req, result)
+        cache._protect_fuzzy_donor_node(req, result)
+
+        self.assertEqual(donor_a.lock_ref, 1)
+        self.assertEqual(donor_b.lock_ref, 1)
+        self.assertEqual(len(req.fuzzy_donor_nodes), 2)
+
+        cache._release_fuzzy_donor_nodes(req)
+
+        self.assertEqual(donor_a.lock_ref, 0)
+        self.assertEqual(donor_b.lock_ref, 0)
+        self.assertEqual(req.fuzzy_donor_nodes, [])
+        self.assertIsNone(req.fuzzy_donor_node)
+
     def test_concurrent_matches_lock_same_donor_node(self):
         try:
             from sglang.srt.mem_cache.base_prefix_cache import (

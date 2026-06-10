@@ -461,7 +461,11 @@ class SchedulerOutputProcessorMixin:
 
             self._handle_finished_req(req, i, logits_output)
 
-            if req.return_logprob:
+            if (
+                req.return_logprob
+                and batch.return_logprob
+                and logits_output.next_token_logprobs is not None
+            ):
                 # Spec v1 handles logprobs inside its own worker.
                 # Normalize: non-spec has 1 token, spec v2 has multiple.
                 if batch.is_spec_v2:

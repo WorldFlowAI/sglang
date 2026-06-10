@@ -463,6 +463,93 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def _release_segmented_sparse_request(req: Req, tree_cache: BasePrefixCache):
+    """Release request-local KV from segmented sparse semantic prefill.
+
+    The request's logical token table contains a mix of exact-prefix entries,
+    borrowed donor entries, and request-owned fresh/decode entries. Normal radix
+    cache cleanup assumes a contiguous request-owned prefix, so keep this path
+    explicit.
+    """
+
+    owned_parts = []
+    owned_locs = getattr(req, "segmented_sparse_owned_locs", None)
+    if owned_locs is not None and owned_locs.numel() > 0:
+        owned_parts.append(owned_locs.reshape(-1).to(dtype=torch.int64))
+
+    prompt_len = int(getattr(req, "segmented_sparse_prompt_len", 0) or 0)
+    allocated_len = int(getattr(req, "kv_allocated_len", 0) or 0)
+    if allocated_len > prompt_len:
+        decode_locs = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            prompt_len:allocated_len
+        ].to(dtype=torch.int64)
+        if decode_locs.numel() > 0:
+            owned_parts.append(decode_locs.reshape(-1))
+
+    owned_count = sum(int(part.numel()) for part in owned_parts)
+    if owned_parts:
+        allocator = tree_cache.token_to_kv_pool_allocator
+        owned_indices = torch.cat(owned_parts)
+        if hasattr(allocator, "full_available_size"):
+            available_before = allocator.full_available_size()
+        else:
+            available_before = allocator.available_size()
+        was_grouped = not getattr(allocator, "is_not_in_free_group", True)
+        if was_grouped:
+            allocator.is_not_in_free_group = True
+        try:
+            allocator.free(owned_indices)
+        finally:
+            if was_grouped:
+                allocator.is_not_in_free_group = False
+        if hasattr(allocator, "full_available_size"):
+            available_after = allocator.full_available_size()
+        else:
+            available_after = allocator.available_size()
+    else:
+        available_before = None
+        available_after = None
+
+    if not req.kv_committed_freed:
+        req.pop_committed_kv_cache()
+    if not req.kv_overallocated_freed:
+        req.pop_overallocated_kv_cache()
+
+    release_donor_nodes = getattr(tree_cache, "_release_fuzzy_donor_nodes", None)
+    if release_donor_nodes is not None:
+        release_donor_nodes(req)
+
+    last_node = getattr(req, "last_node", None)
+    if last_node is not None:
+        tree_cache.dec_lock_ref(last_node)
+        req.last_node = None
+
+    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+        not tree_cache.supports_mamba()
+    ):
+        if req.mamba_pool_idx is not None:
+            tree_cache.req_to_token_pool.free_mamba_cache(req)
+
+    tree_cache.req_to_token_pool.free(req)
+    req.segmented_sparse_released_uncached_len = int(
+        getattr(req, "segmented_sparse_fresh_token_count", 0) or 0
+    )
+    logger.info(
+        "released segmented sparse request-local KV: rid=%s owned_tokens=%d prompt_tokens=%d allocated_tokens=%d available_before=%s available_after=%s",
+        getattr(req, "rid", None),
+        owned_count,
+        prompt_len,
+        allocated_len,
+        available_before,
+        available_after,
+    )
+    req.segmented_sparse_owned_locs = None
+    req.segmented_sparse_prompt_len = 0
+    req.segmented_sparse_fresh_token_count = 0
+    req.segmented_sparse_prefill_active = False
+    req.semantic_kv_request_local = False
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
@@ -475,6 +562,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        return
+
+    has_segmented_sparse_owned_locs = (
+        getattr(req, "segmented_sparse_owned_locs", None) is not None
+        or int(getattr(req, "segmented_sparse_prompt_len", 0) or 0) > 0
+    )
+    if getattr(req, "semantic_kv_request_local", False) and (
+        getattr(req, "segmented_sparse_prefill_active", False)
+        or has_segmented_sparse_owned_locs
+    ):
+        _release_segmented_sparse_request(req, tree_cache)
         return
 
     # Streaming sessions transfer req_pool ownership into SessionSlot objects.

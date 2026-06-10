@@ -65,6 +65,8 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixP
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
+    alloc_req_slots,
+    alloc_token_slots,
     evict_from_tree_cache,
     release_kv_cache,
 )
@@ -734,7 +736,20 @@ class Req(ReqDllmMixin):
         self.cache_protected_len: int = 0
         # Number of fuzzy-matched tokens appended to prefix_indices.
         self.cache_fuzzy_matched_len: int = 0
-        # Donor TreeNode protected until this request finishes.
+        self.fuzzy_match_result: Any = None
+        self.segmented_prefill_fuzzy_result: Any = None
+        self.segmented_prefill_plan: Any = None
+        self.requires_segmented_prefill_backend: bool = False
+        self.segmented_sparse_prefill_active: bool = False
+        self.segmented_phased_paged_logged: bool = False
+        self.semantic_kv_request_local: bool = False
+        self.semantic_kv_tree_prefix_len: int = 0
+        self.segmented_sparse_owned_locs: Any = None
+        self.segmented_sparse_prompt_len: int = 0
+        self.segmented_sparse_fresh_token_count: int = 0
+        self.segmented_sparse_released_uncached_len: int = 0
+        # Donor TreeNodes protected until this request finishes.
+        self.fuzzy_donor_nodes: List[Any] = []
         self.fuzzy_donor_node: Any = None
 
         # Recipient-owned slots reserved for RoPE-corrected donor KV.
@@ -997,7 +1012,24 @@ class Req(ReqDllmMixin):
             max_prefix_len = 0
             token_ids = []
 
-        if tree_cache is not None:
+        skip_tree_cache_match = (
+            tree_cache is not None
+            and self.semantic_kv_request_local
+            and len(self.prefix_indices) > 0
+        )
+        if skip_tree_cache_match:
+            # Approximate semantic donor KV is request-local. Do not re-match
+            # against the exact radix tree, because the tree must not learn or
+            # replay non-exact donor spans as token-exact prefix hits.
+            self.fuzzy_match_result = None
+            self.cache_fuzzy_matched_len = 0
+
+        if tree_cache is not None and not skip_tree_cache_match:
+            self.fuzzy_match_result = None
+            self.segmented_prefill_plan = None
+            self.segmented_prefill_fuzzy_result = None
+            self.requires_segmented_prefill_backend = False
+            self.segmented_sparse_prefill_active = False
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1224,7 +1256,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
-        # Keep fuzzy_donor_node locked until cache_finished_req releases it.
+        # Keep fuzzy donor nodes locked until cache_finished_req releases them.
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -1241,6 +1273,18 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
+        self.fuzzy_match_result = None
+        self.segmented_prefill_fuzzy_result = None
+        self.segmented_prefill_plan = None
+        self.requires_segmented_prefill_backend = False
+        self.segmented_sparse_prefill_active = False
+        self.segmented_phased_paged_logged = False
+        self.semantic_kv_request_local = False
+        self.semantic_kv_tree_prefix_len = 0
+        self.segmented_sparse_owned_locs = None
+        self.segmented_sparse_prompt_len = 0
+        self.segmented_sparse_fresh_token_count = 0
+        self.segmented_sparse_released_uncached_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
@@ -1416,6 +1460,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+    segmented_sparse_positions: Optional[torch.Tensor] = None
+    segmented_sparse_prefill_metadata: Optional[List[Any]] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -1592,7 +1638,144 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    def prepare_for_segmented_sparse_extend(self):
+        self.forward_mode = ForwardMode.EXTEND
+        reqs = self.reqs
+        if not reqs:
+            return
+        if any(req.multimodal_inputs is not None for req in reqs):
+            raise RuntimeError("segmented sparse prefill does not support multimodal inputs")
+
+        _pin = is_pin_memory_available(self.device)
+        metadata = [req.segmented_prefill_plan.sparse_prefill_metadata() for req in reqs]
+        full_prompt_ids = [
+            list(req.origin_input_ids[: item.prompt_token_count])
+            for req, item in zip(reqs, metadata)
+        ]
+        input_ids = [
+            list(item.input_token_ids(ids))
+            for ids, item in zip(full_prompt_ids, metadata)
+        ]
+        fresh_positions = [
+            list(item.fresh_positions)
+            for item in metadata
+        ]
+        extend_lens = [item.fresh_token_count for item in metadata]
+        seq_lens = [item.prompt_token_count for item in metadata]
+        orig_seq_lens = [max(item.prompt_token_count, len(req.origin_input_ids)) for req, item in zip(reqs, metadata)]
+
+        total_fresh_tokens = sum(extend_lens)
+        self.prefix_lens = [0 for _ in reqs]
+        self.extend_lens = extend_lens
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.orig_seq_lens = torch.tensor(
+            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+        self.extend_num_tokens = total_fresh_tokens
+
+        req_pool_indices = alloc_req_slots(
+            self.req_to_token_pool, reqs, self.tree_cache
+        )
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        self.req_pool_indices = req_pool_indices_cpu.to(
+            self.device, non_blocking=True
+        )
+        evict_from_tree_cache(self.tree_cache, total_fresh_tokens)
+        self.out_cache_loc = alloc_token_slots(self.tree_cache, total_fresh_tokens)
+
+        input_id_pointer = 0
+        loc_pointer = 0
+        for req, item, req_pool_idx, ids, prompt_ids in zip(
+            reqs, metadata, req_pool_indices, input_ids, full_prompt_ids
+        ):
+            req.req_pool_idx = req_pool_idx
+            req.extend_batch_idx += 1
+            req.fill_ids = list(prompt_ids) + list(req.output_ids)
+            req.kv_committed_len = item.prompt_token_count
+            req.kv_allocated_len = item.prompt_token_count
+            req.already_computed = item.prompt_token_count
+            req.is_retracted = False
+            req.semantic_kv_request_local = True
+            req.segmented_sparse_prompt_len = item.prompt_token_count
+            req.segmented_sparse_fresh_token_count = item.fresh_token_count
+            req.segmented_sparse_released_uncached_len = 0
+            req.segmented_sparse_owned_locs = None
+
+            if item.exact_prefix_len:
+                self.req_to_token_pool.write(
+                    (req_pool_idx, slice(0, item.exact_prefix_len)),
+                    req.prefix_indices[: item.exact_prefix_len],
+                )
+
+            if item.donor_positions:
+                donor_positions = torch.tensor(
+                    item.donor_positions, dtype=torch.long, device=self.device
+                )
+                donor_kv_indices = torch.tensor(
+                    item.donor_kv_indices,
+                    dtype=self.req_to_token_pool.req_to_token.dtype,
+                    device=self.device,
+                )
+                self.req_to_token_pool.write(
+                    (req_pool_idx, donor_positions),
+                    donor_kv_indices,
+                )
+
+            fresh_count = len(ids)
+            if fresh_count:
+                fresh_pos = torch.tensor(
+                    item.fresh_positions, dtype=torch.long, device=self.device
+                )
+                fresh_locs = self.out_cache_loc[loc_pointer : loc_pointer + fresh_count]
+                self.req_to_token_pool.write(
+                    (req_pool_idx, fresh_pos),
+                    fresh_locs.to(self.req_to_token_pool.req_to_token.dtype),
+                )
+                req.segmented_sparse_owned_locs = fresh_locs.to(dtype=torch.int64)
+                loc_pointer += fresh_count
+                input_id_pointer += fresh_count
+
+        self.input_ids = torch.tensor(
+            list(chain.from_iterable(input_ids)),
+            dtype=torch.int64,
+            pin_memory=_pin,
+        ).to(self.device, non_blocking=True)
+        self.segmented_sparse_positions = torch.tensor(
+            list(chain.from_iterable(fresh_positions)),
+            dtype=torch.int64,
+            pin_memory=_pin,
+        ).to(self.device, non_blocking=True)
+        self.segmented_sparse_prefill_metadata = metadata
+        self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
+        self.multimodal_inputs = [req.multimodal_inputs for req in reqs]
+        self.token_type_ids = None
+        self.seq_lens_sum = sum(seq_lens)
+        # Sparse prefill computes non-contiguous fresh prompt holes. Requesting
+        # input logprobs for every fresh hole can materialize a large
+        # fresh_tokens x vocab tensor and OOM. Keep the normal sampled-token row
+        # but skip prompt input-logprob work for this experimental path.
+        self.extend_logprob_start_lens = extend_lens
+        self.extend_input_logprob_token_ids = None
+        self.return_logprob = False
+        self.top_logprobs_nums = None
+        self.token_ids_logprobs = None
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
+        if input_id_pointer != total_fresh_tokens or loc_pointer != total_fresh_tokens:
+            raise RuntimeError("segmented sparse prefill metadata/token mismatch")
+
     def prepare_for_extend(self):
+        if any(getattr(req, "segmented_sparse_prefill_active", False) for req in self.reqs):
+            return self.prepare_for_segmented_sparse_extend()
+
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2469,6 +2652,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            segmented_sparse_positions=self.segmented_sparse_positions,
+            segmented_sparse_prefill_metadata=self.segmented_sparse_prefill_metadata,
         )
 
     def copy(self):
@@ -2664,3 +2849,5 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    segmented_sparse_positions: Optional[torch.Tensor] = None
+    segmented_sparse_prefill_metadata: Optional[List[Any]] = None
