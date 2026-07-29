@@ -75,9 +75,9 @@ class FuzzyMatchConfig(msgspec.Struct):
                 f"got {self.fuzzy_semantic_threshold}"
             )
 
-        if self.fuzzy_match_provider not in ("SemanticEmbedding",):
+        if self.fuzzy_match_provider not in ("SemanticEmbedding", "ExactHash"):
             raise ValueError(
-                f"fuzzy_match_provider must be 'SemanticEmbedding', "
+                f"fuzzy_match_provider must be 'SemanticEmbedding' or 'ExactHash', "
                 f"got {self.fuzzy_match_provider}"
             )
 

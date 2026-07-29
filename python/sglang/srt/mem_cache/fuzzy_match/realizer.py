@@ -33,7 +33,7 @@ import torch
 from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
     copy_kv_with_rope_correction,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -47,7 +47,19 @@ class FuzzyKVRealizer:
     def __init__(self, req_to_token_pool, token_to_kv_pool_allocator, model):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.pool = token_to_kv_pool_allocator.get_kvcache()
+        pool = token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(pool, HybridLinearKVPool) and not pool.use_mla:
+            # Hybrid full-attention + linear-attention models (e.g. Qwen3.5's
+            # GatedDeltaNet layers) keep the full-attention layers' KV in a
+            # nested pool (`full_kv_pool`), already indexed 0..N-1 scoped to
+            # just those layers — exactly what copy_kv_with_rope_correction's
+            # `range(pool.layer_num)` loop expects, with no extra layer-id
+            # remapping needed. The linear-attention layers have no
+            # per-token K to correct at all (irreversible recurrent state,
+            # not addressable K) and live entirely outside this nested pool,
+            # so there's nothing else to unwrap for them.
+            pool = pool.full_kv_pool
+        self.pool = pool
         # MLA-style pools have no separate K/V buffers; realization is
         # MHA-only for now.
         self.pool_supported = isinstance(self.pool, MHATokenToKVPool)
@@ -59,20 +71,38 @@ class FuzzyKVRealizer:
             )
         if self.rotary_emb is None:
             logger.warning(
-                "[FUZZY] model exposes no layer-0 rotary_emb; fuzzy "
+                "[FUZZY] model exposes no rotary_emb on any layer; fuzzy "
                 "realization disabled"
             )
 
     @staticmethod
     def _resolve_rotary_emb(model):
-        # Model class layouts differ per architecture; probe the common
-        # llama-style path (model.model.layers[0].self_attn.rotary_emb).
+        # Model class layouts differ per architecture: some hold rotary_emb
+        # under a self_attn submodule (e.g. layers[i].self_attn.rotary_emb),
+        # others hold it directly on the decoder layer with no self_attn
+        # indirection at all. Hybrid architectures also mix layer types
+        # across model.model.layers (e.g. Qwen3.5's GatedDeltaNet layers
+        # expose neither), so probing layer 0 specifically is unsafe. Scan
+        # for the first layer that actually has one — every full-attention
+        # layer in a given model shares the same
+        # rope_theta/rotary_dim/max_position_embeddings, so any one match is
+        # as good as any other.
         inner = getattr(model, "model", None)
         layers = getattr(inner, "layers", None)
         if not layers:
             return None
-        self_attn = getattr(layers[0], "self_attn", None)
-        return getattr(self_attn, "rotary_emb", None)
+        for layer in layers:
+            self_attn = getattr(layer, "self_attn", None)
+            rotary_emb = (
+                getattr(self_attn, "rotary_emb", None)
+                if self_attn is not None
+                else None
+            )
+            if rotary_emb is None:
+                rotary_emb = getattr(layer, "rotary_emb", None)
+            if rotary_emb is not None:
+                return rotary_emb
+        return None
 
     def realize(self, fuzzy_reqs: List[Req]) -> None:
         """Realize every pending fuzzy match, then clear per-request state.

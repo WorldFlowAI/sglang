@@ -2889,7 +2889,10 @@ class ServerArgs:
         (
             "FuzzyMatchProvider implementation used by the fuzzy_match "
             "radix-cache backend. 'SemanticEmbedding' finds donor KV by "
-            "semantic similarity (requires the 'semblend' package)."
+            "semantic similarity (requires the 'semblend' package). "
+            "'ExactHash' finds donor KV by exact content match at a "
+            "different offset (content-defined chunking, no external "
+            "dependency) — lossless, unlike 'SemanticEmbedding'."
         ),
         NS("memory"),
     ] = "SemanticEmbedding"
