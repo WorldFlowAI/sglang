@@ -136,7 +136,9 @@ class TestExactHashProviderMatching(CustomTestCase):
         query_content = [222] * 200  # different content, forced same fingerprint
 
         def fake_chunks(tokens):
-            return [Chunk(start=0, end=len(tokens), token_ids=list(tokens), fingerprint=1)]
+            return [
+                Chunk(start=0, end=len(tokens), token_ids=list(tokens), fingerprint=1)
+            ]
 
         with patch(
             "sglang.srt.mem_cache.fuzzy_match.exact_hash_provider.chunk_tokens",

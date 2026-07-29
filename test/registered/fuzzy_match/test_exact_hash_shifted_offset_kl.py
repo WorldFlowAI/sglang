@@ -108,14 +108,11 @@ class TestExactHashShiftedOffset(CustomTestCase):
 
         def rand_tokens(n):
             return [
-                rng.randint(SYNTHETIC_TOKEN_LOW, SYNTHETIC_TOKEN_HIGH)
-                for _ in range(n)
+                rng.randint(SYNTHETIC_TOKEN_LOW, SYNTHETIC_TOKEN_HIGH) for _ in range(n)
             ]
 
         donor_contents = [rand_tokens(DONOR_TOKENS) for _ in range(NUM_SAMPLES)]
-        query_prefixes = [
-            rand_tokens(QUERY_PREFIX_TOKENS) for _ in range(NUM_SAMPLES)
-        ]
+        query_prefixes = [rand_tokens(QUERY_PREFIX_TOKENS) for _ in range(NUM_SAMPLES)]
 
         _flush_cache(self.base_url)
 

@@ -89,9 +89,7 @@ except ImportError:
         # gives the same "cheap, non-cryptographic-role" fingerprint
         # xxHash64 would — the token-ID equality check downstream is what
         # actually guards correctness, not this hash's collision odds.
-        digest = hashlib.blake2b(
-            _tokens_to_bytes(token_ids), digest_size=8
-        ).digest()
+        digest = hashlib.blake2b(_tokens_to_bytes(token_ids), digest_size=8).digest()
         return int.from_bytes(digest, "little")
 
 
@@ -141,9 +139,7 @@ def chunk_tokens(token_ids: Sequence[int]) -> List[Chunk]:
         chunk_len = i - chunk_start + 1
         if chunk_len < MIN_CHUNK_TOKENS:
             continue
-        at_boundary = (i - chunk_start + 1 >= WINDOW_SIZE) and (
-            h & _BOUNDARY_MASK == 0
-        )
+        at_boundary = (i - chunk_start + 1 >= WINDOW_SIZE) and (h & _BOUNDARY_MASK == 0)
         if at_boundary or chunk_len >= MAX_CHUNK_TOKENS:
             span = token_ids[chunk_start : i + 1]
             chunks.append(

@@ -1,12 +1,21 @@
 # Fuzzy KV Cache Reuse (`--radix-cache-backend fuzzy_match`)
 
-Semantic KV cache reuse for prompts that share meaning but not tokens.
-When exact prefix matching leaves part of a prompt uncovered, a pluggable
-`FuzzyMatchProvider` may nominate donor KV from a previously finished
-request; the donor KV is position-corrected (RoPE) into recipient-owned
-slots before the forward pass. Reuse follows the `|exact|fuzzy|miss|`
-prompt decomposition: one contiguous fuzzy span anchored at the exact
-prefix boundary.
+KV cache reuse for prompts whose content reappears at a different offset
+than where it was originally computed. When exact prefix matching leaves
+part of a prompt uncovered, a pluggable `FuzzyMatchProvider` may nominate
+donor KV from a previously finished request; the donor KV is
+position-corrected (RoPE) into recipient-owned slots before the forward
+pass. Reuse follows the `|exact|fuzzy|miss|` prompt decomposition: one
+contiguous fuzzy span anchored at the exact prefix boundary.
+
+Two providers are available:
+- `SemanticEmbedding` (default): matches merely-similar content by cosine
+  similarity. Requires the `semblend` package. Not lossless — reuse changes
+  model outputs by construction (see Scope and guarantees below).
+- `ExactHash`: matches content that is byte-identical to the current
+  prompt's unmatched tail but sits at a different offset (content-defined
+  chunking, no external dependency). Lossless: every hash hit is confirmed
+  by a token-ID equality check before being served.
 
 ## Enabling
 
@@ -18,6 +27,15 @@ python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-7B-Instruct-AWQ \
   --radix-cache-backend fuzzy_match \
   --fuzzy-model-arch qwen2.5-7b
+```
+
+Or, with no external dependency:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct-AWQ \
+  --radix-cache-backend fuzzy_match \
+  --fuzzy-match-provider ExactHash
 ```
 
 Selecting the backend enables the feature; the default provider is
@@ -98,7 +116,7 @@ detectably stale — never dangling.
 | Flag | Default | Why it exists |
 |---|---|---|
 | `--radix-cache-backend fuzzy_match` | off | The enable switch; registers nothing and costs nothing when unset. |
-| `--fuzzy-match-provider` | `SemanticEmbedding` | Provider selection; the interface admits out-of-tree providers. |
+| `--fuzzy-match-provider` | `SemanticEmbedding` | `SemanticEmbedding` or `ExactHash`; the interface admits out-of-tree providers too. |
 | `--fuzzy-semantic-threshold` | `0.60` | Precision knob: cosine floor for accepting a donor. |
 | `--fuzzy-min-reuse-ratio` | `0.50` | Hit gate: donors covering less of the prompt are rejected. |
 | `--fuzzy-min-match-length` | `16` | Skips fuzzy lookup behind weak partial exact anchors. |
@@ -115,10 +133,13 @@ flags.
   the missed suffix. The default backend path is byte-identical when the
   backend is not selected (two seams: one `MatchResult` field, one no-op
   hook in `cache_finished_req`).
-- Reuse changes model outputs by construction: donor K/V attended to the
-  donor's context. The provider's quality gates plus the per-layer
-  zero-out mask bound the drift; accuracy methodology and results are in
-  the PR description.
-- Not yet supported: MLA-style KV pools, EAGLE speculative decoding,
+- `SemanticEmbedding` reuse changes model outputs by construction: donor
+  K/V attended to the donor's context. The provider's quality gates plus
+  the per-layer zero-out mask bound the drift. `ExactHash` reuse is
+  lossless by construction — matched content is byte-identical to the
+  current prompt, confirmed by a mandatory token-ID equality check on
+  every hit. Accuracy methodology and results for both are in the PR
+  descriptions that introduced them.
+- Not yet supported (both providers): MLA-style KV pools, EAGLE speculative decoding,
   multi-region (`|exact|miss|fuzzy|miss|...`) reuse, hierarchical (host)
   cache interaction. Each is rejected explicitly rather than silently.
