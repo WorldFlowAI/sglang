@@ -374,6 +374,26 @@ def fuzzy_match_backend_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "--radix-cache-backend fuzzy_match does not support EAGLE "
             "speculative decoding yet"
         )
+    if ctx.is_hybrid_ssm:
+        # FuzzyRadixCache(RadixCache) has no awareness of a model's
+        # separate Mamba/SSM state pool the way UnifiedRadixCache's MAMBA
+        # component does (registry.py's is_hybrid_ssm branch routes there
+        # instead, for every other backend). Registering fuzzy-matched
+        # content still inserts into the tree normally, but the
+        # invariant checker's mamba-pool accounting (which assumes
+        # whatever cache impl is active correctly tracks mamba slot
+        # protection) goes out of sync, surfacing as a confusing
+        # "pool memory leak detected!" crash with no fuzzy-match frames
+        # in the stack, found empirically running this backend against a
+        # real hybrid full-attention + GatedDeltaNet model. Fail loudly at
+        # startup instead.
+        raise ValueError(
+            "--radix-cache-backend fuzzy_match does not support hybrid "
+            "SSM/Mamba models yet (e.g. Qwen3.5's GatedDeltaNet layers) — "
+            "FuzzyRadixCache has no mamba-pool accounting, unlike "
+            "UnifiedRadixCache's MAMBA component that every other backend "
+            "routes through for these models"
+        )
     config = FuzzyMatchConfig.from_server_args(ctx.server_args)
     provider = create_fuzzy_match_provider(config)
     cache = FuzzyRadixCache(params=ctx.params)

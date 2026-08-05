@@ -132,8 +132,14 @@ def create_fuzzy_match_provider(
         )
 
         return SemanticEmbeddingProvider(config)
+    elif provider_name == "ExactHash":
+        from sglang.srt.mem_cache.fuzzy_match.exact_hash_provider import (
+            ExactHashProvider,
+        )
+
+        return ExactHashProvider(config)
     else:
         raise ValueError(
             f"Unknown fuzzy match provider: {provider_name}. "
-            f"Supported providers: 'SemanticEmbedding'"
+            f"Supported providers: 'SemanticEmbedding', 'ExactHash'"
         )

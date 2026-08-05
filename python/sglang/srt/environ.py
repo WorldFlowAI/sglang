@@ -383,6 +383,12 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # Fuzzy-match E2E tests: force every chunk fingerprint to the same
+    # constant, so two genuinely different chunks collide by construction —
+    # exercises the mandatory token-ID equality-check fallback at the real
+    # system level (through the live scheduler), which can't otherwise be
+    # forced without an astronomically unlikely real hash collision.
+    SGLANG_TEST_FUZZY_FORCE_HASH_COLLISION = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.
